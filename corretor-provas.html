@@ -369,8 +369,18 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
     catch(e){setErro("Erro: "+e.message);setEtapa("foto");}
   }
 
-  const acertos=respostas.filter((r,i)=>r&&r===(gabarito[i]||"").toUpperCase()).length;
-  const nota=total>0?((acertos/total)*10).toFixed(1):"0";
+  const pontos = (() => {
+    try { return JSON.parse(prova.pontos_questao || '[]'); } catch { return []; }
+  })();
+  const temPontos = pontos.length > 0 && pontos.some(p => p !== 1);
+  const totalPontos = pontos.length > 0 ? pontos.reduce((a,b) => a + (b||1), 0) : total;
+
+  const acertos = respostas.filter((r,i) => r && r===(gabarito[i]||"").toUpperCase()).length;
+  const pontosAluno = respostas.reduce((soma, r, i) => {
+    const acertou = r && r === (gabarito[i]||"").toUpperCase();
+    return soma + (acertou ? (pontos[i] || 1) : 0);
+  }, 0);
+  const nota = totalPontos > 0 ? ((pontosAluno / totalPontos) * 10).toFixed(1) : "0";
 
   if(etapa==="instrucao")return(
     <div style={{minHeight:"100vh",background:"#f5f6fa"}}>
@@ -436,6 +446,7 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
           <div style={{paddingBottom:"8px"}}>
             <p style={{color:"#fff",fontWeight:"700",fontSize:"22px"}}>{acertos}/{total}</p>
             <p style={{color:"rgba(255,255,255,0.6)",fontSize:"13px"}}>acertos</p>
+            {temPontos&&<p style={{color:"rgba(255,255,255,0.85)",fontSize:"13px",marginTop:"4px"}}>{pontosAluno.toFixed(1)} de {totalPontos} pts</p>}
           </div>
         </div>
       </div>
@@ -449,6 +460,7 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
               <div>
                 <span style={{fontSize:"13px",color:"#666"}}>Resp: <strong style={{color:vazio?"#bbb":acertou?"#2e7d32":"#c62828"}}>{resp||"—"}</strong></span>
                 <span style={{fontSize:"13px",color:"#aaa",marginLeft:"12px"}}>Gab: <strong style={{color:"#333"}}>{(gab||"").toUpperCase()}</strong></span>
+                {temPontos && <span style={{fontSize:"12px",color:"#aaa",marginLeft:"10px"}}>{pontos[i]||1} pt{(pontos[i]||1)!==1?"s":""}</span>}
               </div>
             </div>
             <span style={{fontSize:"18px"}}>{vazio?"□":acertou?"✓":"✗"}</span>
@@ -456,7 +468,7 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
         })}
         <div style={{display:"flex",gap:"10px",marginTop:"16px"}}>
           <button onClick={()=>{setFotoUrl(null);setImgEl(null);setEtapa("instrucao");}} style={{flex:1,padding:"14px",background:"#fff",border:"2px solid #e0e0e0",borderRadius:"12px",fontSize:"14px",fontWeight:"600",color:"#555",cursor:"pointer"}}>&#128247; Refazer</button>
-          <button onClick={()=>onSalvar({alunoId:aluno.id,nomeAluno:aluno.nome,turma,acertos,total,nota,data:new Date().toLocaleDateString("pt-BR")})}
+          <button onClick={()=>onSalvar({alunoId:aluno.id,nomeAluno:aluno.nome,turma,acertos,total,nota,pontosAluno:pontosAluno.toFixed(1),totalPontos,data:new Date().toLocaleDateString("pt-BR")})}
             style={{flex:2,padding:"14px",background:"linear-gradient(135deg,#2e7d32,#388e3c)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"15px",fontWeight:"700",cursor:"pointer",boxShadow:"0 4px 14px rgba(46,125,50,0.3)"}}>
             &#10003; Salvar Nota
           </button>
