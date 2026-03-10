@@ -274,21 +274,53 @@ function TelaAluno({prova, alunos, correcoes, onConfirmar, onVoltar}){
 
 // ─── ANALISE OPENCV ────────────────────────────────────────────────────────────
 async function analisarCartao(imgEl,totalQ){
-  // Layout horizontal: cabeçalho de números em cima, linhas A-E abaixo
-  // Por bloco de 10 questões:
-  //   - 1 linha header (números) + 5 linhas (A,B,C,D,E) = 6 linhas no total
-  //   - N colunas (N = questões no bloco)
-  // A coluna mais à esquerda é a label (A/B/C/D/E) — ignoramos ela
   if(typeof cv==="undefined"||!cv.Mat)await new Promise(r=>setTimeout(r,2000));
+
   const canvas=document.createElement("canvas");
   const ctx=canvas.getContext("2d");
-  canvas.width=imgEl.naturalWidth;canvas.height=imgEl.naturalHeight;
+  canvas.width=imgEl.naturalWidth;
+  canvas.height=imgEl.naturalHeight;
   ctx.drawImage(imgEl,0,0);
+
   const src=cv.matFromImageData(ctx.getImageData(0,0,canvas.width,canvas.height));
-  const gray=new cv.Mat(),thresh=new cv.Mat();
+  const gray=new cv.Mat(), blurred=new cv.Mat(), thresh=new cv.Mat(), edges=new cv.Mat();
   cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
-  cv.threshold(gray,thresh,0,255,cv.THRESH_BINARY_INV+cv.THRESH_OTSU);
-  const W=canvas.width,H=canvas.height;
+  cv.GaussianBlur(gray,blurred,new cv.Size(5,5),0);
+
+  // ── Detectar região do cartão automaticamente ──────────────────────────────
+  // O cartão é o maior retângulo claro na imagem
+  let xOff=0, yOff=0, W=canvas.width, H=canvas.height;
+  try {
+    const thresh2=new cv.Mat(), contours=new cv.MatVector(), hierarchy=new cv.Mat();
+    cv.threshold(blurred,thresh2,180,255,cv.THRESH_BINARY);
+    cv.findContours(thresh2,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+
+    let bestArea=0, bestRect=null;
+    for(let i=0;i<contours.size();i++){
+      const cnt=contours.get(i);
+      const rect=cv.boundingRect(cnt);
+      const area=rect.width*rect.height;
+      const ratio=rect.width/rect.height;
+      // Cartão tem proporção aproximada — mais largo que alto, área grande
+      if(area>bestArea && area>(canvas.width*canvas.height*0.1) && ratio>0.3 && ratio<5){
+        bestArea=area; bestRect=rect;
+      }
+      cnt.delete();
+    }
+    if(bestRect && bestRect.width>100 && bestRect.height>100){
+      // Adicionar margem de 2%
+      const mx=Math.floor(bestRect.width*0.02), my=Math.floor(bestRect.height*0.02);
+      xOff=Math.max(0,bestRect.x+mx);
+      yOff=Math.max(0,bestRect.y+my);
+      W=Math.min(canvas.width-xOff, bestRect.width-mx*2);
+      H=Math.min(canvas.height-yOff, bestRect.height-my*2);
+    }
+    thresh2.delete(); contours.delete(); hierarchy.delete();
+  } catch(e){ console.warn('[cartao] detecção automática falhou, usando imagem inteira'); }
+
+  // ── Threshold para detecção de marcações ──────────────────────────────────
+  cv.threshold(blurred,thresh,0,255,cv.THRESH_BINARY_INV+cv.THRESH_OTSU);
+
   const LETRAS=["A","B","C","D","E"];
   const totalBlocos=Math.ceil(totalQ/10);
   const respostas=[];
@@ -296,53 +328,50 @@ async function analisarCartao(imgEl,totalQ){
   for(let b=0;b<totalBlocos;b++){
     const ini=b*10, fim=Math.min(ini+10,totalQ), qtd=fim-ini;
 
-    // Região vertical deste bloco
-    const blocoH = H/totalBlocos;
-    const yBloco = b*blocoH;
+    // Região vertical deste bloco dentro da área detectada
+    const blocoH=H/totalBlocos;
+    const yBloco=yOff+b*blocoH;
 
-    // 6 linhas: 1 header + 5 letras
-    const linhaH = blocoH/6;
+    // 6 linhas: 1 header + 5 letras (A,B,C,D,E)
+    const linhaH=blocoH/6;
 
-    // Colunas: 1 label (ignorar) + qtd questões
-    // Estimamos a largura da label como ~8% da largura total do bloco
-    const labelW = W*0.08;
-    const areaW  = W - labelW;
-    const colW   = areaW/qtd;
+    // Largura da coluna label (~10% da largura)
+    const labelW=W*0.10;
+    const areaW=W-labelW;
+    const colW=areaW/qtd;
 
     for(let qi=0;qi<qtd;qi++){
       const pcts=[];
 
       for(let li=0;li<5;li++){
-        const yc = Math.floor(yBloco + (li+1)*linhaH + linhaH*0.1);
-        const hc = Math.floor(linhaH*0.8);
-        const xc = Math.floor(labelW + qi*colW + colW*0.1);
-        const wc = Math.floor(colW*0.8);
+        // linha li+1 pula o header; margem interna de 15% para evitar borda da célula
+        const yc=Math.floor(yBloco+(li+1)*linhaH+linhaH*0.15);
+        const hc=Math.floor(linhaH*0.70);
+        const xc=Math.floor(xOff+labelW+qi*colW+colW*0.15);
+        const wc=Math.floor(colW*0.70);
 
-        let escuros=0;
-        const total=wc*hc;
-        for(let py=yc;py<yc+hc&&py<H;py++)
-          for(let px=xc;px<xc+wc&&px<W;px++)
-            if(thresh.ucharAt(py,px)>128)escuros++;
-
-        pcts.push(escuros/total);
+        let escuros=0, total=0;
+        for(let py=yc;py<yc+hc&&py<canvas.height;py++)
+          for(let px=xc;px<xc+wc&&px<canvas.width;px++){
+            if(thresh.ucharAt(py,px)>128) escuros++;
+            total++;
+          }
+        pcts.push(total>0?escuros/total:0);
       }
 
-      // Encontrar a mais escura e comparar com as demais
-      const maxPct   = Math.max(...pcts);
-      const iMax     = pcts.indexOf(maxPct);
-      const outros   = pcts.filter((_,i)=>i!==iMax);
-      const segundaMax = Math.max(...outros);
-      const media    = pcts.reduce((a,b)=>a+b,0)/pcts.length;
+      const maxPct=Math.max(...pcts);
+      const iMax=pcts.indexOf(maxPct);
+      const outros=pcts.filter((_,i)=>i!==iMax);
+      const segundaMax=Math.max(...outros);
+      const mediaOutros=outros.reduce((a,b)=>a+b,0)/outros.length;
 
-      // Considerar marcada apenas se:
-      // 1. Passa threshold absoluto minimo (>15%)
-      // 2. É pelo menos 2x mais escura que a média das outras 4
-      // 3. Está pelo menos 8pp acima da segunda mais escura
-      const marcada = maxPct>0.15 && maxPct>(media*2.0) && (maxPct-segundaMax)>0.08;
+      // Marcada se: absoluto >12%, pelo menos 1.8x a média das outras, 7pp acima da 2ª
+      const marcada=maxPct>0.12 && maxPct>(mediaOutros*1.8) && (maxPct-segundaMax)>0.07;
       respostas.push(marcada?LETRAS[iMax]:null);
     }
   }
-  src.delete();gray.delete();thresh.delete();
+
+  src.delete(); gray.delete(); blurred.delete(); thresh.delete(); edges.delete();
   return respostas;
 }
 
