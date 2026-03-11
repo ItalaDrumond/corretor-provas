@@ -273,105 +273,109 @@ function TelaAluno({prova, alunos, correcoes, onConfirmar, onVoltar}){
 }
 
 // ─── ANALISE OPENCV ────────────────────────────────────────────────────────────
-async function analisarCartao(imgEl,totalQ){
-  if(typeof cv==="undefined"||!cv.Mat)await new Promise(r=>setTimeout(r,2000));
+// Layout do cartão:
+//   - Linhas  → alternativas A, B, C, D, E  (eixo Y, de cima pra baixo)
+//   - Colunas → questões 1, 2, 3...         (eixo X, da esquerda pra direita)
+//   - Linha de cabeçalho (números) no topo  → ignorada
+//   - Coluna de label (A/B/C/D/E) à esquerda → ignorada
+//
+// Para cada questão qi (coluna) lemos as 5 células (linhas A..E)
+// e identificamos qual está marcada.
 
-  const canvas=document.createElement("canvas");
-  const ctx=canvas.getContext("2d");
-  canvas.width=imgEl.naturalWidth;
-  canvas.height=imgEl.naturalHeight;
-  ctx.drawImage(imgEl,0,0);
+async function analisarCartao(imgEl, totalQ){
+  if(typeof cv==="undefined"||!cv.Mat) await new Promise(r=>setTimeout(r,2500));
+  if(typeof cv==="undefined"||!cv.Mat) throw new Error("OpenCV não carregou. Tente novamente.");
 
-  const src=cv.matFromImageData(ctx.getImageData(0,0,canvas.width,canvas.height));
-  const gray=new cv.Mat(), blurred=new cv.Mat(), thresh=new cv.Mat(), edges=new cv.Mat();
-  cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
-  cv.GaussianBlur(gray,blurred,new cv.Size(5,5),0);
+  const canvas = document.createElement("canvas");
+  const ctx    = canvas.getContext("2d");
+  canvas.width  = imgEl.naturalWidth;
+  canvas.height = imgEl.naturalHeight;
+  ctx.drawImage(imgEl, 0, 0);
 
-  // ── Detectar região do cartão automaticamente ──────────────────────────────
-  // O cartão é o maior retângulo claro na imagem
-  let xOff=0, yOff=0, W=canvas.width, H=canvas.height;
-  try {
-    const thresh2=new cv.Mat(), contours=new cv.MatVector(), hierarchy=new cv.Mat();
-    cv.threshold(blurred,thresh2,180,255,cv.THRESH_BINARY);
-    cv.findContours(thresh2,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+  const W = canvas.width, H = canvas.height;
+  const src   = cv.matFromImageData(ctx.getImageData(0,0,W,H));
+  const gray  = new cv.Mat();
+  const thresh= new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  // Threshold adaptativo: mais robusto a sombras e iluminação irregular
+  cv.adaptiveThreshold(gray, thresh, 255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 31, 8);
 
-    let bestArea=0, bestRect=null;
-    for(let i=0;i<contours.size();i++){
-      const cnt=contours.get(i);
-      const rect=cv.boundingRect(cnt);
-      const area=rect.width*rect.height;
-      const ratio=rect.width/rect.height;
-      // Cartão tem proporção aproximada — mais largo que alto, área grande
-      if(area>bestArea && area>(canvas.width*canvas.height*0.1) && ratio>0.3 && ratio<5){
-        bestArea=area; bestRect=rect;
-      }
-      cnt.delete();
-    }
-    if(bestRect && bestRect.width>100 && bestRect.height>100){
-      // Adicionar margem de 2%
-      const mx=Math.floor(bestRect.width*0.02), my=Math.floor(bestRect.height*0.02);
-      xOff=Math.max(0,bestRect.x+mx);
-      yOff=Math.max(0,bestRect.y+my);
-      W=Math.min(canvas.width-xOff, bestRect.width-mx*2);
-      H=Math.min(canvas.height-yOff, bestRect.height-my*2);
-    }
-    thresh2.delete(); contours.delete(); hierarchy.delete();
-  } catch(e){ console.warn('[cartao] detecção automática falhou, usando imagem inteira'); }
+  const LETRAS = ["A","B","C","D","E"];
 
-  // ── Threshold para detecção de marcações ──────────────────────────────────
-  cv.threshold(blurred,thresh,0,255,cv.THRESH_BINARY_INV+cv.THRESH_OTSU);
+  // ── Divisão da grade ──────────────────────────────────────────────────────
+  // Blocos de até 10 questões empilhados verticalmente
+  const totalBlocos = Math.ceil(totalQ / 10);
+  const respostas   = [];
 
-  const LETRAS=["A","B","C","D","E"];
-  const totalBlocos=Math.ceil(totalQ/10);
-  const respostas=[];
+  for(let b = 0; b < totalBlocos; b++){
+    const ini = b*10;
+    const fim = Math.min(ini+10, totalQ);
+    const qtd = fim - ini;  // questões neste bloco (colunas)
 
-  for(let b=0;b<totalBlocos;b++){
-    const ini=b*10, fim=Math.min(ini+10,totalQ), qtd=fim-ini;
+    // Região vertical do bloco
+    const blocoH = H / totalBlocos;
+    const yBloco = b * blocoH;
 
-    // Região vertical deste bloco dentro da área detectada
-    const blocoH=H/totalBlocos;
-    const yBloco=yOff+b*blocoH;
+    // Dentro do bloco:
+    //   - 1ª linha  = cabeçalho de números   → pular
+    //   - linhas 2..6 = A, B, C, D, E
+    // Dividimos em 6 faixas iguais
+    const linhaH = blocoH / 6;
 
-    // 6 linhas: 1 header + 5 letras (A,B,C,D,E)
-    const linhaH=blocoH/6;
+    // Colunas: 1ª coluna = labels A/B/C/D/E  → pular
+    // O restante dividido em qtd colunas iguais
+    // Usamos 12% da largura para a coluna de label
+    const labelFrac = 0.12;
+    const labelW    = W * labelFrac;
+    const areaW     = W - labelW;
+    const colW      = areaW / qtd;
 
-    // Largura da coluna label (~10% da largura)
-    const labelW=W*0.10;
-    const areaW=W-labelW;
-    const colW=areaW/qtd;
+    for(let qi = 0; qi < qtd; qi++){
+      const densidades = [];
 
-    for(let qi=0;qi<qtd;qi++){
-      const pcts=[];
+      for(let li = 0; li < 5; li++){
+        // li=0 → linha A (2ª faixa, índice 1)
+        // li=1 → linha B (3ª faixa, índice 2)  ...
+        const faixaIdx = li + 1;  // pula o cabeçalho (índice 0)
 
-      for(let li=0;li<5;li++){
-        // linha li+1 pula o header; margem interna de 15% para evitar borda da célula
-        const yc=Math.floor(yBloco+(li+1)*linhaH+linhaH*0.15);
-        const hc=Math.floor(linhaH*0.70);
-        const xc=Math.floor(xOff+labelW+qi*colW+colW*0.15);
-        const wc=Math.floor(colW*0.70);
+        // Margem interna de 15% em cada dimensão para evitar bordas da grade
+        const margem = 0.15;
+        const yc = Math.floor(yBloco + faixaIdx * linhaH + linhaH * margem);
+        const hc = Math.floor(linhaH * (1 - 2*margem));
+        const xc = Math.floor(labelW + qi * colW + colW * margem);
+        const wc = Math.floor(colW   * (1 - 2*margem));
 
-        let escuros=0, total=0;
-        for(let py=yc;py<yc+hc&&py<canvas.height;py++)
-          for(let px=xc;px<xc+wc&&px<canvas.width;px++){
-            if(thresh.ucharAt(py,px)>128) escuros++;
-            total++;
-          }
-        pcts.push(total>0?escuros/total:0);
+        // Conta pixels escuros (marcados) na célula
+        let escuros = 0;
+        const area  = Math.max(wc * hc, 1);
+        for(let py = yc; py < yc+hc && py < H; py++)
+          for(let px = xc; px < xc+wc && px < W; px++)
+            if(thresh.ucharAt(py, px) > 128) escuros++;
+
+        densidades.push(escuros / area);
       }
 
-      const maxPct=Math.max(...pcts);
-      const iMax=pcts.indexOf(maxPct);
-      const outros=pcts.filter((_,i)=>i!==iMax);
-      const segundaMax=Math.max(...outros);
-      const mediaOutros=outros.reduce((a,b)=>a+b,0)/outros.length;
+      // ── Decisão ────────────────────────────────────────────────────────────
+      const maxD       = Math.max(...densidades);
+      const iMax       = densidades.indexOf(maxD);
+      const semMax     = densidades.filter((_,i)=>i!==iMax);
+      const segundaMax = Math.max(...semMax);
+      const media      = semMax.reduce((a,v)=>a+v,0) / semMax.length;
 
-      // Marcada se: absoluto >12%, pelo menos 1.8x a média das outras, 7pp acima da 2ª
-      const marcada=maxPct>0.12 && maxPct>(mediaOutros*1.8) && (maxPct-segundaMax)>0.07;
-      respostas.push(marcada?LETRAS[iMax]:null);
+      // Critérios (mais tolerantes para caneta/lápis):
+      // 1. Mínimo 10% de preenchimento
+      // 2. Pelo menos 1.6× a média das outras 4
+      // 3. Pelo menos 6pp acima da segunda maior
+      const marcada = maxD > 0.10
+                   && maxD > (media * 1.6)
+                   && (maxD - segundaMax) > 0.06;
+
+      respostas.push(marcada ? LETRAS[iMax] : null);
     }
   }
 
-  src.delete(); gray.delete(); blurred.delete(); thresh.delete(); edges.delete();
+  src.delete(); gray.delete(); thresh.delete();
   return respostas;
 }
 
@@ -463,8 +467,47 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
     </div>
   );
 
+  // ── Correção manual ──────────────────────────────────────────────────────────
+  const [editIdx, setEditIdx] = React.useState(null); // índice da questão sendo editada
+
+  function corrigirManual(idx, letra){
+    const novas = [...respostas];
+    novas[idx] = letra === "—" ? null : letra;
+    setRespostas(novas);
+    setEditIdx(null);
+  }
+
   if(etapa==="resultado")return(
     <div style={{minHeight:"100vh",background:"#f5f6fa"}}>
+      {/* Popup de correção manual */}
+      {editIdx !== null && (
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:100,display:"flex",alignItems:"flex-end",justifyContent:"center"}}
+             onClick={()=>setEditIdx(null)}>
+          <div onClick={e=>e.stopPropagation()}
+               style={{background:"#fff",borderRadius:"20px 20px 0 0",padding:"24px 20px 36px",width:"100%",maxWidth:"480px"}}>
+            <p style={{fontWeight:"700",fontSize:"16px",color:"#1a1a2e",marginBottom:"6px",textAlign:"center"}}>
+              Questão {editIdx+1} — corrigir manualmente
+            </p>
+            <p style={{fontSize:"13px",color:"#999",textAlign:"center",marginBottom:"20px"}}>
+              Gabarito: <strong style={{color:"#1a1a2e"}}>{(gabarito[editIdx]||"").toUpperCase()}</strong>
+              &nbsp;·&nbsp;Leitura atual: <strong style={{color:"#4361ee"}}>{respostas[editIdx]||"—"}</strong>
+            </p>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"10px"}}>
+              {["A","B","C","D","E","—"].map(l=>(
+                <button key={l} onClick={()=>corrigirManual(editIdx,l)}
+                  style={{padding:"14px",borderRadius:"12px",fontSize:"18px",fontWeight:"700",border:"2px solid",
+                    borderColor: respostas[editIdx]===(l==="—"?null:l) ? "#4361ee":"#e0e0e0",
+                    background:  respostas[editIdx]===(l==="—"?null:l) ? "#4361ee18":"#fff",
+                    color:       respostas[editIdx]===(l==="—"?null:l) ? "#4361ee":"#333",
+                    cursor:"pointer"}}>
+                  {l}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div style={{background:"linear-gradient(135deg,#1a1a2e,#0f3460)",padding:"48px 20px 24px"}}>
         <p style={{color:"rgba(255,255,255,0.7)",fontSize:"13px",marginBottom:"8px"}}>{aluno.nome} · Turma {turma}</p>
         <div style={{display:"flex",alignItems:"flex-end",gap:"16px"}}>
@@ -480,20 +523,27 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
         </div>
       </div>
       <div style={{padding:"16px 20px"}}>
-        <p style={{fontSize:"12px",fontWeight:"600",color:"#999",textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:"10px"}}>Questao por questao</p>
+        <p style={{fontSize:"12px",fontWeight:"600",color:"#999",textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:"4px"}}>Questao por questao</p>
+        <p style={{fontSize:"11px",color:"#bbb",marginBottom:"12px"}}>Toque em qualquer questão para corrigir manualmente ✏️</p>
         {gabarito.map((gab,i)=>{
           const resp=respostas[i];const acertou=resp&&resp===(gab||"").toUpperCase();const vazio=!resp;
-          return(<div key={i} className={"fadein "+(vazio?"branco":acertou?"acerto":"cerro")} style={{borderRadius:"10px",padding:"12px 16px",marginBottom:"8px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-            <div style={{display:"flex",alignItems:"center",gap:"12px"}}>
-              <span style={{fontWeight:"700",color:"#666",fontSize:"14px",minWidth:"24px"}}>{i+1}.</span>
-              <div>
-                <span style={{fontSize:"13px",color:"#666"}}>Resp: <strong style={{color:vazio?"#bbb":acertou?"#2e7d32":"#c62828"}}>{resp||"—"}</strong></span>
-                <span style={{fontSize:"13px",color:"#aaa",marginLeft:"12px"}}>Gab: <strong style={{color:"#333"}}>{(gab||"").toUpperCase()}</strong></span>
-                {temPontos && <span style={{fontSize:"12px",color:"#aaa",marginLeft:"10px"}}>{pontos[i]||1} pt{(pontos[i]||1)!==1?"s":""}</span>}
+          return(
+            <div key={i} onClick={()=>setEditIdx(i)}
+              className={"fadein "+(vazio?"branco":acertou?"acerto":"cerro")}
+              style={{borderRadius:"10px",padding:"12px 16px",marginBottom:"8px",display:"flex",
+                      justifyContent:"space-between",alignItems:"center",cursor:"pointer",
+                      boxShadow: editIdx===i ? "0 0 0 2px #4361ee":"none"}}>
+              <div style={{display:"flex",alignItems:"center",gap:"12px"}}>
+                <span style={{fontWeight:"700",color:"#666",fontSize:"14px",minWidth:"24px"}}>{i+1}.</span>
+                <div>
+                  <span style={{fontSize:"13px",color:"#666"}}>Resp: <strong style={{color:vazio?"#bbb":acertou?"#2e7d32":"#c62828"}}>{resp||"—"}</strong></span>
+                  <span style={{fontSize:"13px",color:"#aaa",marginLeft:"12px"}}>Gab: <strong style={{color:"#333"}}>{(gab||"").toUpperCase()}</strong></span>
+                  {temPontos && <span style={{fontSize:"12px",color:"#aaa",marginLeft:"10px"}}>{pontos[i]||1} pt{(pontos[i]||1)!==1?"s":""}</span>}
+                </div>
               </div>
+              <span style={{fontSize:"18px"}}>{vazio?"□":acertou?"✓":"✗"}</span>
             </div>
-            <span style={{fontSize:"18px"}}>{vazio?"□":acertou?"✓":"✗"}</span>
-          </div>);
+          );
         })}
         <div style={{display:"flex",gap:"10px",marginTop:"16px"}}>
           <button onClick={()=>{setFotoUrl(null);setImgEl(null);setEtapa("instrucao");}} style={{flex:1,padding:"14px",background:"#fff",border:"2px solid #e0e0e0",borderRadius:"12px",fontSize:"14px",fontWeight:"600",color:"#555",cursor:"pointer"}}>&#128247; Refazer</button>
