@@ -363,11 +363,11 @@ async function analisarCartao(imgEl, totalQ){
 
       // Caneta preta/azul: célula marcada tem densidade >> demais
       // Critério A: mínimo absoluto (abaixo = ruído, não caneta)
-      const minAbs = maxD >= 0.15;
+      const minAbs = maxD >= 0.08;
       // Critério B: pelo menos 2× a segunda maior (dominância forte)
-      const domSeg = maxD >= segundaD * 2.0;
+      const domSeg = maxD >= segundaD * 1.4;
       // Critério C: pelo menos 3× a média das outras 4 (destaque geral)
-      const domMed = maxD >= mediaRest * 3.0;
+      const domMed = maxD >= mediaRest * 1.8;
 
       if(minAbs && domSeg && domMed){
         respostas.push(LETRAS[iMax]);
