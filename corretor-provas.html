@@ -338,7 +338,7 @@ async function analisarCartao(imgEl, totalQ){
 
       for(let li = 0; li < 5; li++){
         // Margem de 20%: evita bordas da grade (principal causa de falso positivo)
-        const margem   = 0.20;
+        const margem   = 0.11;
         const faixaIdx = li + 1;
         const yc = Math.floor(yBloco + faixaIdx * linhaH + linhaH * margem);
         const hc = Math.max(Math.floor(linhaH * (1 - 2*margem)), 1);
