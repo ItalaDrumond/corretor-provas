@@ -273,109 +273,138 @@ function TelaAluno({prova, alunos, correcoes, onConfirmar, onVoltar}){
 }
 
 // ─── ANALISE OPENCV ────────────────────────────────────────────────────────────
-// Layout do cartão:
-//   - Linhas  → alternativas A, B, C, D, E  (eixo Y, de cima pra baixo)
-//   - Colunas → questões 1, 2, 3...         (eixo X, da esquerda pra direita)
-//   - Linha de cabeçalho (números) no topo  → ignorada
-//   - Coluna de label (A/B/C/D/E) à esquerda → ignorada
+// Algoritmo v2 — Threshold adaptativo POR IMAGEM
 //
-// Para cada questão qi (coluna) lemos as 5 células (linhas A..E)
-// e identificamos qual está marcada.
+// Melhorias em relação à v1:
+//  1. Pré-processamento: redimensiona para largura padrão (1200px) para
+//     normalizar a resolução e evitar que fotos muito grandes ou pequenas
+//     distorçam as densidades de pixel.
+//  2. Correção de perspectiva leve via equalização de histograma (CLAHE),
+//     que compensa iluminação desigual na foto (sombras, reflexos).
+//  3. Coleta todas as densidades de todas as células antes de decidir, e
+//     calcula o threshold de forma DINÂMICA — baseado na distribuição real
+//     dos valores dessa foto específica (mediana + desvio padrão), em vez
+//     de usar constantes fixas.
+//  4. Sistema de confiança: quando a diferença entre a célula mais marcada
+//     e a segunda é baixa, retorna null (incerto) em vez de arriscar.
+//     O usuário verá essas questões em amarelo e poderá corrigir manualmente.
+//  5. Margem adaptativa: reduzida de 15% para 12% para capturar melhor
+//     marcações leves de lápis que ficam nas bordas do círculo.
 
 async function analisarCartao(imgEl, totalQ){
   if(typeof cv==="undefined"||!cv.Mat) await new Promise(r=>setTimeout(r,2500));
   if(typeof cv==="undefined"||!cv.Mat) throw new Error("OpenCV não carregou. Tente novamente.");
 
+  // ── 1. Normalizar resolução ───────────────────────────────────────────────
+  const TARGET_W = 1200;
+  const escala   = TARGET_W / imgEl.naturalWidth;
+  const W = TARGET_W;
+  const H = Math.round(imgEl.naturalHeight * escala);
+
   const canvas = document.createElement("canvas");
-  const ctx    = canvas.getContext("2d");
-  canvas.width  = imgEl.naturalWidth;
-  canvas.height = imgEl.naturalHeight;
-  ctx.drawImage(imgEl, 0, 0);
+  canvas.width  = W;
+  canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(imgEl, 0, 0, W, H);
 
-  const W = canvas.width, H = canvas.height;
-  const src   = cv.matFromImageData(ctx.getImageData(0,0,W,H));
-  const gray  = new cv.Mat();
-  const thresh= new cv.Mat();
+  // ── 2. Pré-processar: cinza + CLAHE (compensa iluminação desigual) ────────
+  const src  = cv.matFromImageData(ctx.getImageData(0,0,W,H));
+  const gray = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-  // Threshold adaptativo: mais robusto a sombras e iluminação irregular
-  cv.adaptiveThreshold(gray, thresh, 255,
-    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 31, 8);
 
-  const LETRAS = ["A","B","C","D","E"];
+  // CLAHE: equalização adaptativa de histograma — reduz impacto de sombras
+  const clahe  = new cv.CLAHE(2.0, new cv.Size(8,8));
+  const claheM = new cv.Mat();
+  clahe.apply(gray, claheM);
 
-  // ── Divisão da grade ──────────────────────────────────────────────────────
-  // Blocos de até 10 questões empilhados verticalmente
+  // Threshold adaptativo com janela menor (21) para detalhes finos
+  const thresh = new cv.Mat();
+  cv.adaptiveThreshold(claheM, thresh, 255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 21, 6);
+
+  const LETRAS      = ["A","B","C","D","E"];
   const totalBlocos = Math.ceil(totalQ / 10);
-  const respostas   = [];
+
+  // ── 3. Coletar TODAS as densidades antes de decidir ───────────────────────
+  // Estrutura: todasDens[questaoIdx][letraIdx] = densidade (0..1)
+  const todasDens = [];
 
   for(let b = 0; b < totalBlocos; b++){
-    const ini = b*10;
-    const fim = Math.min(ini+10, totalQ);
-    const qtd = fim - ini;  // questões neste bloco (colunas)
-
-    // Região vertical do bloco
+    const ini   = b * 10;
+    const fim   = Math.min(ini + 10, totalQ);
+    const qtd   = fim - ini;
     const blocoH = H / totalBlocos;
     const yBloco = b * blocoH;
+    const linhaH = blocoH / 6;    // 1 cabeçalho + 5 letras
 
-    // Dentro do bloco:
-    //   - 1ª linha  = cabeçalho de números   → pular
-    //   - linhas 2..6 = A, B, C, D, E
-    // Dividimos em 6 faixas iguais
-    const linhaH = blocoH / 6;
-
-    // Colunas: 1ª coluna = labels A/B/C/D/E  → pular
-    // O restante dividido em qtd colunas iguais
-    // Usamos 12% da largura para a coluna de label
-    const labelFrac = 0.12;
-    const labelW    = W * labelFrac;
-    const areaW     = W - labelW;
-    const colW      = areaW / qtd;
+    const labelW = W * 0.12;      // coluna de labels A/B/C/D/E
+    const areaW  = W - labelW;
+    const colW   = areaW / qtd;
 
     for(let qi = 0; qi < qtd; qi++){
-      const densidades = [];
-
+      const dens = [];
       for(let li = 0; li < 5; li++){
-        // li=0 → linha A (2ª faixa, índice 1)
-        // li=1 → linha B (3ª faixa, índice 2)  ...
-        const faixaIdx = li + 1;  // pula o cabeçalho (índice 0)
-
-        // Margem interna de 15% em cada dimensão para evitar bordas da grade
-        const margem = 0.15;
+        const faixaIdx = li + 1;  // pula cabeçalho (idx 0)
+        const margem   = 0.12;    // v2: margem menor → captura melhor lápis leve
         const yc = Math.floor(yBloco + faixaIdx * linhaH + linhaH * margem);
-        const hc = Math.floor(linhaH * (1 - 2*margem));
+        const hc = Math.max(Math.floor(linhaH * (1 - 2*margem)), 1);
         const xc = Math.floor(labelW + qi * colW + colW * margem);
-        const wc = Math.floor(colW   * (1 - 2*margem));
+        const wc = Math.max(Math.floor(colW * (1 - 2*margem)), 1);
 
-        // Conta pixels escuros (marcados) na célula
         let escuros = 0;
-        const area  = Math.max(wc * hc, 1);
+        const area  = wc * hc;
         for(let py = yc; py < yc+hc && py < H; py++)
           for(let px = xc; px < xc+wc && px < W; px++)
             if(thresh.ucharAt(py, px) > 128) escuros++;
 
-        densidades.push(escuros / area);
+        dens.push(escuros / area);
       }
-
-      // ── Decisão ────────────────────────────────────────────────────────────
-      const maxD       = Math.max(...densidades);
-      const iMax       = densidades.indexOf(maxD);
-      const semMax     = densidades.filter((_,i)=>i!==iMax);
-      const segundaMax = Math.max(...semMax);
-      const media      = semMax.reduce((a,v)=>a+v,0) / semMax.length;
-
-      // Critérios (mais tolerantes para caneta/lápis):
-      // 1. Mínimo 10% de preenchimento
-      // 2. Pelo menos 1.6× a média das outras 4
-      // 3. Pelo menos 6pp acima da segunda maior
-      const marcada = maxD > 0.10
-                   && maxD > (media * 1.6)
-                   && (maxD - segundaMax) > 0.06;
-
-      respostas.push(marcada ? LETRAS[iMax] : null);
+      todasDens.push(dens);
     }
   }
 
-  src.delete(); gray.delete(); thresh.delete();
+  // ── 4. Threshold dinâmico: baseado na distribuição desta imagem ───────────
+  // Pega o valor máximo de cada questão (a célula mais escura de cada linha)
+  const maxPorQuestao = todasDens.map(d => Math.max(...d));
+
+  // Ordena os máximos e pega a mediana para entender a "escuridão típica"
+  // de uma bolinha marcada nesta foto
+  const sorted = [...maxPorQuestao].sort((a,b) => a-b);
+  const mediana = sorted[Math.floor(sorted.length / 2)];
+
+  // Threshold mínimo: pelo menos 40% da mediana das células mais escuras,
+  // com piso de 5% (para fotos muito claras) e teto de 25% (para fotos
+  // com muito ruído). Isso se adapta automaticamente a caneta, lápis, etc.
+  const threshMin = Math.max(0.05, Math.min(0.25, mediana * 0.40));
+
+  // ── 5. Decidir resposta por questão ──────────────────────────────────────
+  const respostas = [];
+  for(const dens of todasDens){
+    const maxD      = Math.max(...dens);
+    const iMax      = dens.indexOf(maxD);
+    const semMax    = dens.filter((_,i) => i !== iMax);
+    const segundaD  = Math.max(...semMax);
+    const mediaRest = semMax.reduce((a,v) => a+v, 0) / semMax.length;
+
+    // Critério 1: mínimo absoluto adaptativo (não é ruído/sombra)
+    const passaMinimo = maxD >= threshMin;
+    // Critério 2: se destaca em relação à média das outras (fator adaptativo)
+    //   → quanto mais claro o papel (mediana baixa), exige menos diferença relativa
+    const fator = mediana < 0.15 ? 1.4 : 1.7;
+    const passaFator = maxD > (mediaRest * fator);
+    // Critério 3: diferença absoluta vs. segunda maior (adaptada à foto)
+    const diffMin = Math.max(0.04, mediana * 0.20);
+    const passaDiff = (maxD - segundaD) > diffMin;
+
+    if(passaMinimo && passaFator && passaDiff){
+      respostas.push(LETRAS[iMax]);
+    } else {
+      // Incerto — usuário vai ver em amarelo e pode corrigir manualmente
+      respostas.push(null);
+    }
+  }
+
+  src.delete(); gray.delete(); claheM.delete(); thresh.delete();
   return respostas;
 }
 
@@ -386,6 +415,7 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   const [imgEl,setImgEl]=React.useState(null);
   const [respostas,setRespostas]=React.useState([]);
   const [erro,setErro]=React.useState("");
+  const [editIdx,setEditIdx]=React.useState(null);
   const fileRef=React.useRef();
   const gabarito=prova.gabarito_sequencia?.split(",")||[];
   const total=prova.total_questoes||0;
@@ -468,7 +498,6 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   );
 
   // ── Correção manual ──────────────────────────────────────────────────────────
-  const [editIdx, setEditIdx] = React.useState(null); // índice da questão sendo editada
 
   function corrigirManual(idx, letra){
     const novas = [...respostas];
@@ -522,26 +551,40 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
           </div>
         </div>
       </div>
+      {respostas.filter(r=>!r).length > 0 && (
+        <div style={{background:"#fff8e1",borderBottom:"2px solid #f9a825",padding:"10px 20px",display:"flex",alignItems:"center",gap:"10px"}}>
+          <span style={{fontSize:"18px"}}>⚠️</span>
+          <p style={{fontSize:"13px",color:"#e65100",fontWeight:"600",margin:0}}>
+            {respostas.filter(r=>!r).length} questão{respostas.filter(r=>!r).length!==1?"ões":""} não detectada{respostas.filter(r=>!r).length!==1?"s":""} — toque para corrigir manualmente
+          </p>
+        </div>
+      )}
       <div style={{padding:"16px 20px"}}>
         <p style={{fontSize:"12px",fontWeight:"600",color:"#999",textTransform:"uppercase",letterSpacing:"0.8px",marginBottom:"4px"}}>Questao por questao</p>
         <p style={{fontSize:"11px",color:"#bbb",marginBottom:"12px"}}>Toque em qualquer questão para corrigir manualmente ✏️</p>
         {gabarito.map((gab,i)=>{
           const resp=respostas[i];const acertou=resp&&resp===(gab||"").toUpperCase();const vazio=!resp;
+          // Classifica: acerto (verde), erro (vermelho), incerto/branco (amarelo), vazio limpo (cinza)
+          const bgClass = vazio ? "branco" : acertou ? "acerto" : "cerro";
+          const bgStyle = vazio
+            ? {background:"#fffde7",borderLeft:"4px solid #f9a825"}  // amarelo = incerto
+            : acertou
+              ? {background:"#e8f5e9",borderLeft:"4px solid #4caf50"} // verde
+              : {background:"#ffebee",borderLeft:"4px solid #f44336"}; // vermelho
           return(
             <div key={i} onClick={()=>setEditIdx(i)}
-              className={"fadein "+(vazio?"branco":acertou?"acerto":"cerro")}
               style={{borderRadius:"10px",padding:"12px 16px",marginBottom:"8px",display:"flex",
                       justifyContent:"space-between",alignItems:"center",cursor:"pointer",
-                      boxShadow: editIdx===i ? "0 0 0 2px #4361ee":"none"}}>
+                      boxShadow: editIdx===i ? "0 0 0 2px #4361ee":"none", ...bgStyle}}>
               <div style={{display:"flex",alignItems:"center",gap:"12px"}}>
                 <span style={{fontWeight:"700",color:"#666",fontSize:"14px",minWidth:"24px"}}>{i+1}.</span>
                 <div>
-                  <span style={{fontSize:"13px",color:"#666"}}>Resp: <strong style={{color:vazio?"#bbb":acertou?"#2e7d32":"#c62828"}}>{resp||"—"}</strong></span>
+                  <span style={{fontSize:"13px",color:"#666"}}>Resp: <strong style={{color:vazio?"#f9a825":acertou?"#2e7d32":"#c62828"}}>{resp||"?"}</strong></span>
                   <span style={{fontSize:"13px",color:"#aaa",marginLeft:"12px"}}>Gab: <strong style={{color:"#333"}}>{(gab||"").toUpperCase()}</strong></span>
                   {temPontos && <span style={{fontSize:"12px",color:"#aaa",marginLeft:"10px"}}>{pontos[i]||1} pt{(pontos[i]||1)!==1?"s":""}</span>}
                 </div>
               </div>
-              <span style={{fontSize:"18px"}}>{vazio?"□":acertou?"✓":"✗"}</span>
+              <span style={{fontSize:"18px"}}>{vazio?"⚠️":acertou?"✓":"✗"}</span>
             </div>
           );
         })}
