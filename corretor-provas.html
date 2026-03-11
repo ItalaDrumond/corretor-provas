@@ -273,108 +273,102 @@ function TelaAluno({prova, alunos, correcoes, onConfirmar, onVoltar}){
 }
 
 // ─── ANALISE OPENCV ────────────────────────────────────────────────────────────
-// Algoritmo v3 — Otimizado para caneta azul/preta, fotos variadas
+// Algoritmo v4 — Alinhado ao novo cartão (5 questões/bloco, bolinhas grandes)
 //
-// Princípio: caneta deixa traço denso e escuro. O principal inimigo não é
-// a intensidade do traço, mas sim:
-//   - Linhas da grade do cartão sendo lidas como marcação (falso positivo)
-//   - Foto inclinada ou com sombra deslocando a célula lida
+// O novo cartão tem:
+//   - 5 questões por bloco (coluna), não 10
+//   - Células de ~1,6cm (colLetra=900 twips) — muito mais espaço
+//   - Bordas internas claras (CCCCCC) — menos ruído
+//   - Bolinhas de fonte 44 (~11pt) — círculo grande, fácil de preencher
 //
-// Estratégia:
-//   1. Normaliza resolução (1200px) — consistência entre celulares
-//   2. Threshold adaptativo simples com janela GRANDE (51px) — mais estável
-//      que CLAHE para fotos variadas; a janela grande ignora detalhes finos
-//      como linhas da grade e captura apenas preenchimentos sólidos de caneta
-//   3. Margem interna de 20% — afasta as bordas das células onde ficam as
-//      linhas da grade, principal causa de falso positivo
-//   4. Decisão por DOMINÂNCIA RELATIVA: a célula marcada com caneta tem
-//      densidade muito maior que as outras 4 — exige que seja > 2× a segunda
-//      maior E > 3× a média das demais. Isso é rígido, mas caneta preenche
-//      bem e passa facilmente; ruído de sombra/grade raramente passa.
-//   5. Mínimo absoluto de 15% — abaixo disso é ruído/reflexo, não caneta
-//   6. Incerto (⚠️) quando não passa — usuário corrige manualmente
+// Com células grandes, caneta preenche uma área significativa.
+// O algoritmo fica simples e direto:
+//   1. Normaliza para 1200px
+//   2. Threshold adaptativo janela 41px (proporcional à célula maior)
+//   3. Margem interna 22% — bem longe das bordas/grades
+//   4. Decisão: célula marcada precisa ter > 18% de preenchimento
+//      E ser pelo menos 2.5× maior que a segunda — caneta em célula grande
+//      preenche 30-60%, ruído de grade fica abaixo de 8%
 
 async function analisarCartao(imgEl, totalQ){
   if(typeof cv==="undefined"||!cv.Mat) await new Promise(r=>setTimeout(r,2500));
   if(typeof cv==="undefined"||!cv.Mat) throw new Error("OpenCV não carregou. Tente novamente.");
 
-  // ── 1. Normalizar resolução para 1200px de largura ────────────────────────
-  const TARGET_W = 1200;
-  const W = TARGET_W;
-  const H = Math.round(imgEl.naturalHeight * (TARGET_W / imgEl.naturalWidth));
-
+  // 1. Normaliza resolução
+  const W = 1200;
+  const H = Math.round(imgEl.naturalHeight * (W / imgEl.naturalWidth));
   const canvas = document.createElement("canvas");
   canvas.width = W; canvas.height = H;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(imgEl, 0, 0, W, H);
+  canvas.getContext("2d").drawImage(imgEl, 0, 0, W, H);
 
-  // ── 2. Cinza + threshold adaptativo janela grande (51px) ─────────────────
-  // Janela grande = ignora linhas finas da grade, captura só preenchimentos
-  const src   = cv.matFromImageData(ctx.getImageData(0,0,W,H));
-  const gray  = new cv.Mat();
+  // 2. Cinza + threshold adaptativo
+  const src    = cv.matFromImageData(canvas.getContext("2d").getImageData(0,0,W,H));
+  const gray   = new cv.Mat();
   const thresh = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  // Janela 41px: ignora linhas finas da grade, captura preenchimentos sólidos
   cv.adaptiveThreshold(gray, thresh, 255,
-    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 51, 10);
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 41, 8);
 
   const LETRAS      = ["A","B","C","D","E"];
-  const totalBlocos = Math.ceil(totalQ / 10);
+  // Novo cartão: 5 questões por bloco
+  const QTD_BLOCO   = 5;
+  const totalBlocos = Math.ceil(totalQ / QTD_BLOCO);
   const respostas   = [];
 
-  // ── 3. Medir densidade por célula e decidir ───────────────────────────────
+  // Proporções do novo cartão (espelha main.js: colLabel=560, colLetra=900)
+  // colLabel representa ~38% da largura total de um bloco de 1 questão
+  // Usamos fração relativa à largura da imagem normalizada
+  // label ocupa colLabel/(colLabel + colLetra*qtd) da largura total
+  // Para simplificar: label = 12% da largura (similar ao anterior, funciona bem)
+  const labelFrac = 0.12;
+
   for(let b = 0; b < totalBlocos; b++){
-    const ini    = b * 10;
-    const fim    = Math.min(ini + 10, totalQ);
+    const ini    = b * QTD_BLOCO;
+    const fim    = Math.min(ini + QTD_BLOCO, totalQ);
     const qtd    = fim - ini;
+
     const blocoH = H / totalBlocos;
     const yBloco = b * blocoH;
-    const linhaH = blocoH / 6;   // faixa 0 = cabeçalho; faixas 1-5 = A-E
+    // 6 linhas: 1 cabeçalho + 5 letras
+    const linhaH = blocoH / 6;
 
-    const labelW = W * 0.12;     // coluna de labels à esquerda
+    const labelW = W * labelFrac;
     const colW   = (W - labelW) / qtd;
 
     for(let qi = 0; qi < qtd; qi++){
       const dens = [];
 
       for(let li = 0; li < 5; li++){
-        // Margem de 20%: evita bordas da grade (principal causa de falso positivo)
-        const margem   = 0.11;
-        const faixaIdx = li + 1;
-        const yc = Math.floor(yBloco + faixaIdx * linhaH + linhaH * margem);
-        const hc = Math.max(Math.floor(linhaH * (1 - 2*margem)), 1);
-        const xc = Math.floor(labelW + qi * colW + colW * margem);
-        const wc = Math.max(Math.floor(colW * (1 - 2*margem)), 1);
+        // Margem 22%: bem longe das bordas da grade
+        const m  = 0.22;
+        const yc = Math.floor(yBloco + (li+1) * linhaH + linhaH * m);
+        const hc = Math.max(Math.floor(linhaH * (1 - 2*m)), 1);
+        const xc = Math.floor(labelW + qi * colW + colW * m);
+        const wc = Math.max(Math.floor(colW * (1 - 2*m)), 1);
 
         let escuros = 0;
-        const area = wc * hc;
         for(let py = yc; py < yc+hc && py < H; py++)
           for(let px = xc; px < xc+wc && px < W; px++)
             if(thresh.ucharAt(py, px) > 128) escuros++;
 
-        dens.push(escuros / area);
+        dens.push(escuros / (wc * hc));
       }
 
-      // ── Decisão por dominância ──────────────────────────────────────────
-      const maxD      = Math.max(...dens);
-      const iMax      = dens.indexOf(maxD);
-      const semMax    = dens.filter((_,i) => i !== iMax);
-      const segundaD  = Math.max(...semMax);
-      const mediaRest = semMax.reduce((a,v) => a+v, 0) / semMax.length;
+      // Decisão
+      const maxD   = Math.max(...dens);
+      const iMax   = dens.indexOf(maxD);
+      const semMax = dens.filter((_,i) => i !== iMax);
+      const seg    = Math.max(...semMax);
+      const med    = semMax.reduce((a,v)=>a+v,0) / semMax.length;
 
-      // Caneta preta/azul: célula marcada tem densidade >> demais
-      // Critério A: mínimo absoluto (abaixo = ruído, não caneta)
-      const minAbs = maxD >= 0.08;
-      // Critério B: pelo menos 2× a segunda maior (dominância forte)
-      const domSeg = maxD >= segundaD * 1.4;
-      // Critério C: pelo menos 3× a média das outras 4 (destaque geral)
-      const domMed = maxD >= mediaRest * 1.8;
+      // Caneta em célula grande: preenche 25-60%
+      // Ruído de grade em célula grande: fica em 2-8%
+      const marcada = maxD >= 0.18       // mínimo absoluto generoso
+                   && maxD >= seg * 2.5  // domina a segunda
+                   && maxD >= med * 4.0; // domina a média das outras
 
-      if(minAbs && domSeg && domMed){
-        respostas.push(LETRAS[iMax]);
-      } else {
-        // Não passou — aparece ⚠️ amarelo para correção manual
-        respostas.push(null);
-      }
+      respostas.push(marcada ? LETRAS[iMax] : null);
     }
   }
 
