@@ -273,138 +273,112 @@ function TelaAluno({prova, alunos, correcoes, onConfirmar, onVoltar}){
 }
 
 // ─── ANALISE OPENCV ────────────────────────────────────────────────────────────
-// Algoritmo v2 — Threshold adaptativo POR IMAGEM
+// Algoritmo v3 — Otimizado para caneta azul/preta, fotos variadas
 //
-// Melhorias em relação à v1:
-//  1. Pré-processamento: redimensiona para largura padrão (1200px) para
-//     normalizar a resolução e evitar que fotos muito grandes ou pequenas
-//     distorçam as densidades de pixel.
-//  2. Correção de perspectiva leve via equalização de histograma (CLAHE),
-//     que compensa iluminação desigual na foto (sombras, reflexos).
-//  3. Coleta todas as densidades de todas as células antes de decidir, e
-//     calcula o threshold de forma DINÂMICA — baseado na distribuição real
-//     dos valores dessa foto específica (mediana + desvio padrão), em vez
-//     de usar constantes fixas.
-//  4. Sistema de confiança: quando a diferença entre a célula mais marcada
-//     e a segunda é baixa, retorna null (incerto) em vez de arriscar.
-//     O usuário verá essas questões em amarelo e poderá corrigir manualmente.
-//  5. Margem adaptativa: reduzida de 15% para 12% para capturar melhor
-//     marcações leves de lápis que ficam nas bordas do círculo.
+// Princípio: caneta deixa traço denso e escuro. O principal inimigo não é
+// a intensidade do traço, mas sim:
+//   - Linhas da grade do cartão sendo lidas como marcação (falso positivo)
+//   - Foto inclinada ou com sombra deslocando a célula lida
+//
+// Estratégia:
+//   1. Normaliza resolução (1200px) — consistência entre celulares
+//   2. Threshold adaptativo simples com janela GRANDE (51px) — mais estável
+//      que CLAHE para fotos variadas; a janela grande ignora detalhes finos
+//      como linhas da grade e captura apenas preenchimentos sólidos de caneta
+//   3. Margem interna de 20% — afasta as bordas das células onde ficam as
+//      linhas da grade, principal causa de falso positivo
+//   4. Decisão por DOMINÂNCIA RELATIVA: a célula marcada com caneta tem
+//      densidade muito maior que as outras 4 — exige que seja > 2× a segunda
+//      maior E > 3× a média das demais. Isso é rígido, mas caneta preenche
+//      bem e passa facilmente; ruído de sombra/grade raramente passa.
+//   5. Mínimo absoluto de 15% — abaixo disso é ruído/reflexo, não caneta
+//   6. Incerto (⚠️) quando não passa — usuário corrige manualmente
 
 async function analisarCartao(imgEl, totalQ){
   if(typeof cv==="undefined"||!cv.Mat) await new Promise(r=>setTimeout(r,2500));
   if(typeof cv==="undefined"||!cv.Mat) throw new Error("OpenCV não carregou. Tente novamente.");
 
-  // ── 1. Normalizar resolução ───────────────────────────────────────────────
+  // ── 1. Normalizar resolução para 1200px de largura ────────────────────────
   const TARGET_W = 1200;
-  const escala   = TARGET_W / imgEl.naturalWidth;
   const W = TARGET_W;
-  const H = Math.round(imgEl.naturalHeight * escala);
+  const H = Math.round(imgEl.naturalHeight * (TARGET_W / imgEl.naturalWidth));
 
   const canvas = document.createElement("canvas");
-  canvas.width  = W;
-  canvas.height = H;
+  canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext("2d");
   ctx.drawImage(imgEl, 0, 0, W, H);
 
-  // ── 2. Pré-processar: cinza + CLAHE (compensa iluminação desigual) ────────
-  const src  = cv.matFromImageData(ctx.getImageData(0,0,W,H));
-  const gray = new cv.Mat();
-  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-  // CLAHE: equalização adaptativa de histograma — reduz impacto de sombras
-  const clahe  = new cv.CLAHE(2.0, new cv.Size(8,8));
-  const claheM = new cv.Mat();
-  clahe.apply(gray, claheM);
-
-  // Threshold adaptativo com janela menor (21) para detalhes finos
+  // ── 2. Cinza + threshold adaptativo janela grande (51px) ─────────────────
+  // Janela grande = ignora linhas finas da grade, captura só preenchimentos
+  const src   = cv.matFromImageData(ctx.getImageData(0,0,W,H));
+  const gray  = new cv.Mat();
   const thresh = new cv.Mat();
-  cv.adaptiveThreshold(claheM, thresh, 255,
-    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 21, 6);
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  cv.adaptiveThreshold(gray, thresh, 255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 51, 10);
 
   const LETRAS      = ["A","B","C","D","E"];
   const totalBlocos = Math.ceil(totalQ / 10);
+  const respostas   = [];
 
-  // ── 3. Coletar TODAS as densidades antes de decidir ───────────────────────
-  // Estrutura: todasDens[questaoIdx][letraIdx] = densidade (0..1)
-  const todasDens = [];
-
+  // ── 3. Medir densidade por célula e decidir ───────────────────────────────
   for(let b = 0; b < totalBlocos; b++){
-    const ini   = b * 10;
-    const fim   = Math.min(ini + 10, totalQ);
-    const qtd   = fim - ini;
+    const ini    = b * 10;
+    const fim    = Math.min(ini + 10, totalQ);
+    const qtd    = fim - ini;
     const blocoH = H / totalBlocos;
     const yBloco = b * blocoH;
-    const linhaH = blocoH / 6;    // 1 cabeçalho + 5 letras
+    const linhaH = blocoH / 6;   // faixa 0 = cabeçalho; faixas 1-5 = A-E
 
-    const labelW = W * 0.12;      // coluna de labels A/B/C/D/E
-    const areaW  = W - labelW;
-    const colW   = areaW / qtd;
+    const labelW = W * 0.12;     // coluna de labels à esquerda
+    const colW   = (W - labelW) / qtd;
 
     for(let qi = 0; qi < qtd; qi++){
       const dens = [];
+
       for(let li = 0; li < 5; li++){
-        const faixaIdx = li + 1;  // pula cabeçalho (idx 0)
-        const margem   = 0.12;    // v2: margem menor → captura melhor lápis leve
+        // Margem de 20%: evita bordas da grade (principal causa de falso positivo)
+        const margem   = 0.20;
+        const faixaIdx = li + 1;
         const yc = Math.floor(yBloco + faixaIdx * linhaH + linhaH * margem);
         const hc = Math.max(Math.floor(linhaH * (1 - 2*margem)), 1);
         const xc = Math.floor(labelW + qi * colW + colW * margem);
         const wc = Math.max(Math.floor(colW * (1 - 2*margem)), 1);
 
         let escuros = 0;
-        const area  = wc * hc;
+        const area = wc * hc;
         for(let py = yc; py < yc+hc && py < H; py++)
           for(let px = xc; px < xc+wc && px < W; px++)
             if(thresh.ucharAt(py, px) > 128) escuros++;
 
         dens.push(escuros / area);
       }
-      todasDens.push(dens);
+
+      // ── Decisão por dominância ──────────────────────────────────────────
+      const maxD      = Math.max(...dens);
+      const iMax      = dens.indexOf(maxD);
+      const semMax    = dens.filter((_,i) => i !== iMax);
+      const segundaD  = Math.max(...semMax);
+      const mediaRest = semMax.reduce((a,v) => a+v, 0) / semMax.length;
+
+      // Caneta preta/azul: célula marcada tem densidade >> demais
+      // Critério A: mínimo absoluto (abaixo = ruído, não caneta)
+      const minAbs = maxD >= 0.15;
+      // Critério B: pelo menos 2× a segunda maior (dominância forte)
+      const domSeg = maxD >= segundaD * 2.0;
+      // Critério C: pelo menos 3× a média das outras 4 (destaque geral)
+      const domMed = maxD >= mediaRest * 3.0;
+
+      if(minAbs && domSeg && domMed){
+        respostas.push(LETRAS[iMax]);
+      } else {
+        // Não passou — aparece ⚠️ amarelo para correção manual
+        respostas.push(null);
+      }
     }
   }
 
-  // ── 4. Threshold dinâmico: baseado na distribuição desta imagem ───────────
-  // Pega o valor máximo de cada questão (a célula mais escura de cada linha)
-  const maxPorQuestao = todasDens.map(d => Math.max(...d));
-
-  // Ordena os máximos e pega a mediana para entender a "escuridão típica"
-  // de uma bolinha marcada nesta foto
-  const sorted = [...maxPorQuestao].sort((a,b) => a-b);
-  const mediana = sorted[Math.floor(sorted.length / 2)];
-
-  // Threshold mínimo: pelo menos 40% da mediana das células mais escuras,
-  // com piso de 5% (para fotos muito claras) e teto de 25% (para fotos
-  // com muito ruído). Isso se adapta automaticamente a caneta, lápis, etc.
-  const threshMin = Math.max(0.05, Math.min(0.25, mediana * 0.40));
-
-  // ── 5. Decidir resposta por questão ──────────────────────────────────────
-  const respostas = [];
-  for(const dens of todasDens){
-    const maxD      = Math.max(...dens);
-    const iMax      = dens.indexOf(maxD);
-    const semMax    = dens.filter((_,i) => i !== iMax);
-    const segundaD  = Math.max(...semMax);
-    const mediaRest = semMax.reduce((a,v) => a+v, 0) / semMax.length;
-
-    // Critério 1: mínimo absoluto adaptativo (não é ruído/sombra)
-    const passaMinimo = maxD >= threshMin;
-    // Critério 2: se destaca em relação à média das outras (fator adaptativo)
-    //   → quanto mais claro o papel (mediana baixa), exige menos diferença relativa
-    const fator = mediana < 0.15 ? 1.4 : 1.7;
-    const passaFator = maxD > (mediaRest * fator);
-    // Critério 3: diferença absoluta vs. segunda maior (adaptada à foto)
-    const diffMin = Math.max(0.04, mediana * 0.20);
-    const passaDiff = (maxD - segundaD) > diffMin;
-
-    if(passaMinimo && passaFator && passaDiff){
-      respostas.push(LETRAS[iMax]);
-    } else {
-      // Incerto — usuário vai ver em amarelo e pode corrigir manualmente
-      respostas.push(null);
-    }
-  }
-
-  src.delete(); gray.delete(); claheM.delete(); thresh.delete();
+  src.delete(); gray.delete(); thresh.delete();
   return respostas;
 }
 
