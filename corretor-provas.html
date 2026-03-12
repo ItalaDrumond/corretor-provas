@@ -273,84 +273,63 @@ function TelaAluno({prova, alunos, correcoes, onConfirmar, onVoltar}){
 }
 
 // ─── ANALISE OPENCV ────────────────────────────────────────────────────────────
-// Algoritmo v5 — Novo cartão: questão por LINHA, alternativas por COLUNA
+// Algoritmo v6 — Detecta preenchimento de CANETA pelo aluno
 //
-// Layout do cartão gerado pelo main.js:
-//   | Nº |  A  |  B  |  C  |  D  |  E  |
-//   |  1 |  A  |  B  |  C  |  D  |  E  |   ← aluno preenche a célula com caneta
-//   |  2 |  A  |  B  |  C  |  D  |  E  |
-//   ...
-// Célula marcada = fundo escuro (#1a1a2e) + letra branca
-// Célula vazia   = fundo branco + letra cinza
+// Cartão impresso: todas as células são brancas com letra cinza.
+// O aluno preenche a célula com caneta/lápis → muitos pixels escuros.
+// Células vazias: apenas a letrinha cinza impressa → poucos pixels escuros.
 //
-// Proporções (espelhando main.js):
-//   colNro   = 500 twips  (~10,9% da largura total da tabela de 1 col)
-//   colLetra = 850 twips  cada uma
-//   tblW     = 500 + 850*5 = 4750 twips
-//   → colNro  ocupa 500/4750 ≈ 10,5% da largura
-//   → cada alternativa ocupa 850/4750 ≈ 17,9% da largura
+// Detecção RELATIVA por linha: procura a célula mais escura que domine as outras.
+// Sem limiar absoluto alto — funciona mesmo com cartões claros ou foto escura.
 //
-// Para provas > 20 questões: duas tabelas lado a lado (col esq = 1..metade, col dir = resto)
-// Nesse caso a imagem precisa mostrar o cartão inteiro.
-//
-// Detecção: para cada questão (linha), mede a densidade de pixels escuros
-// em cada uma das 5 células de alternativa (sem a coluna Nº).
-// A célula mais escura que superar o limiar é a resposta marcada.
+// Proporções (main.js): colNro=500, colLetra=850, tblW=4750
+//   → colNro  = 10.5% da largura total
+//   → colLetra = 17.9% cada
 
 async function analisarCartao(imgEl, totalQ){
   if(typeof cv==="undefined"||!cv.Mat) await new Promise(r=>setTimeout(r,2500));
   if(typeof cv==="undefined"||!cv.Mat) throw new Error("OpenCV não carregou. Tente novamente.");
 
-  // 1. Normaliza para largura fixa
   const W = 1400;
   const H = Math.round(imgEl.naturalHeight * (W / imgEl.naturalWidth));
   const canvas = document.createElement("canvas");
   canvas.width = W; canvas.height = H;
   canvas.getContext("2d").drawImage(imgEl, 0, 0, W, H);
 
-  // 2. Cinza + threshold adaptativo
-  // Janela 31px captura texto/letra dentro da célula sem pegar bordas finas
   const src    = cv.matFromImageData(canvas.getContext("2d").getImageData(0,0,W,H));
   const gray   = new cv.Mat();
   const thresh = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  // Janela grande (61px) + constante baixa (6): captura manchas de caneta,
+  // ignora letrinhas impressas finas e ruído de grade
   cv.adaptiveThreshold(gray, thresh, 255,
-    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 31, 9);
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 61, 6);
 
   const LETRAS = ["A","B","C","D","E"];
   const respostas = [];
+  const debugCells = [];
 
-  // Proporções do cartão (alinhadas ao main.js)
-  // colNro = 500, colLetra = 850, tblW = 4750
-  // fração da coluna Nº sobre largura total:
-  const nroFrac   = 500  / 4750;  // ≈ 0.105
-  const letraFrac = 850  / 4750;  // ≈ 0.179 por alternativa
-
-  // Para dois blocos lado a lado (> 20 questões):
-  // cada bloco ocupa metade da largura com ~360twips de gap (~4% da largura)
+  const nroFrac = 500 / 4750;   // fração da coluna Nº
   const doisBlocos = totalQ > 20;
   const metade     = Math.ceil(totalQ / 2);
 
   function detectarBloco(questoesNoBloco, xOffset, blocoW) {
-    // xOffset e blocoW em pixels
-    // Cada linha = 1 questão. Altura de cada linha = blocoH / questoesNoBloco
-    const blocoH = H;
-    const linhaH = blocoH / questoesNoBloco;
-    const xNroFim = xOffset + blocoW * nroFrac;   // fim da coluna Nº
-    const xRestante = blocoW * (1 - nroFrac);      // largura das 5 alternativas
+    const linhaH    = H / questoesNoBloco;
+    const xNroFim   = xOffset + blocoW * nroFrac;
+    const xRestante = blocoW * (1 - nroFrac);
+    const colW      = xRestante / 5;
 
     for (let qi = 0; qi < questoesNoBloco; qi++) {
-      const yTopo = Math.floor(qi * linhaH);
-      const yBase = Math.floor((qi + 1) * linhaH);
+      // Margens conservadoras: ignora bordas da grade
+      const mV = 0.12;
+      const mH = 0.10;
+      const yc = Math.floor(qi * linhaH + linhaH * mV);
+      const hc = Math.max(Math.floor(linhaH * (1 - 2*mV)), 1);
 
       const dens = [];
       for (let li = 0; li < 5; li++) {
-        // Margem interna: 20% das bordas para evitar ruído da grade
-        const m = 0.20;
-        const xc  = Math.floor(xNroFim + li * xRestante/5 + xRestante/5 * m);
-        const wc  = Math.max(Math.floor(xRestante/5 * (1 - 2*m)), 1);
-        const yc  = Math.floor(yTopo + linhaH * m);
-        const hc  = Math.max(Math.floor(linhaH * (1 - 2*m)), 1);
+        const xc  = Math.floor(xNroFim + li * colW + colW * mH);
+        const wc  = Math.max(Math.floor(colW * (1 - 2*mH)), 1);
 
         let escuros = 0;
         for (let py = yc; py < yc+hc && py < H; py++)
@@ -360,29 +339,27 @@ async function analisarCartao(imgEl, totalQ){
         dens.push(escuros / (wc * hc));
       }
 
-      // Decisão: célula marcada tem fundo escuro → muito mais pixels pretos
-      // Célula vazia tem apenas a letra cinza fina → baixa densidade
       const maxD  = Math.max(...dens);
       const iMax  = dens.indexOf(maxD);
       const resto = dens.filter((_,i) => i !== iMax);
-      const seg   = Math.max(...resto);
+      const seg   = Math.max(...resto, 0.001);
       const med   = resto.reduce((a,v)=>a+v,0) / resto.length;
 
-      // Limiar: célula preenchida com caneta sobre letra → ≥25% de escuro
-      // Célula vazia com letra cinza fina → ≤10%
-      const marcada = maxD >= 0.20        // mínimo absoluto
-                   && maxD >= seg * 2.0   // pelo menos 2× a segunda
-                   && maxD >= med * 3.5;  // domina bem a média
+      // Caneta preenche muito mais que letra impressa.
+      // Limiar baixo (3%) + dominância relativa = detecta mesmo cartões claros.
+      const marcada = maxD >= 0.03        // há pixels escuros suficientes
+                   && maxD >= seg * 1.6   // domina a segunda alternativa
+                   && maxD >= med * 2.2;  // domina a média das demais
 
+      console.log("[v6] Q"+(qi+1)+" dens="+dens.map(d=>d.toFixed(3))+" → "+(marcada?LETRAS[iMax]:"?"));
       respostas.push(marcada ? LETRAS[iMax] : null);
+      debugCells.push({ qi, xOffset, blocoW, linhaH, xNroFim, xRestante, colW, mV, mH, dens:[...dens], iMax, marcada });
     }
   }
 
   if (!doisBlocos) {
-    // Tabela única ocupando toda a largura
     detectarBloco(totalQ, 0, W);
   } else {
-    // Duas tabelas lado a lado — gap central de ~4% da largura
     const gap    = Math.floor(W * 0.04);
     const blocoW = Math.floor((W - gap) / 2);
     detectarBloco(metade, 0, blocoW);
@@ -390,7 +367,7 @@ async function analisarCartao(imgEl, totalQ){
   }
 
   src.delete(); gray.delete(); thresh.delete();
-  return respostas;
+  return { respostas, debugCells };
 }
 
 // ─── TELA CORRECAO ─────────────────────────────────────────────────────────────
@@ -401,6 +378,8 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   const [respostas,setRespostas]=React.useState([]);
   const [erro,setErro]=React.useState("");
   const [editIdx,setEditIdx]=React.useState(null);
+  const [debugCells,setDebugCells]=React.useState([]);
+  const [showDebug,setShowDebug]=React.useState(false);
   const fileRef=React.useRef();
   const gabarito=prova.gabarito_sequencia?.split(",")||[];
   const total=prova.total_questoes||0;
@@ -413,7 +392,12 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   }
   async function handleAnalisar(){
     if(!imgEl)return;setEtapa("analisando");setErro("");
-    try{const r=await analisarCartao(imgEl,total);setRespostas(r);setEtapa("resultado");}
+    try{
+      const resultado=await analisarCartao(imgEl,total);
+      setRespostas(resultado.respostas);
+      setDebugCells(resultado.debugCells);
+      setEtapa("resultado");
+    }
     catch(e){setErro("Erro: "+e.message);setEtapa("foto");}
   }
 
@@ -470,7 +454,8 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
       <div style={{padding:"16px 20px 32px",display:"flex",gap:"12px"}}>
         <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={onFoto}/>
         <button onClick={()=>fileRef.current.click()} style={{flex:1,padding:"14px",background:"rgba(255,255,255,0.1)",border:"2px solid rgba(255,255,255,0.2)",borderRadius:"12px",color:"#fff",fontSize:"14px",fontWeight:"600",cursor:"pointer"}}>Refazer</button>
-        <button onClick={handleAnalisar} style={{flex:2,padding:"14px",background:"linear-gradient(135deg,#4361ee,#7209b7)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"15px",fontWeight:"700",cursor:"pointer"}}>&#10003; Analisar</button>
+        <button onClick={()=>{setShowDebug(false);handleAnalisar();}} style={{flex:2,padding:"14px",background:"linear-gradient(135deg,#4361ee,#7209b7)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"15px",fontWeight:"700",cursor:"pointer"}}>&#10003; Analisar</button>
+        <button onClick={()=>{setShowDebug(true);handleAnalisar();}} style={{flex:1,padding:"14px",background:"rgba(255,165,0,0.25)",border:"2px solid orange",borderRadius:"12px",color:"orange",fontSize:"13px",fontWeight:"600",cursor:"pointer"}}>&#128269; Debug</button>
       </div>
     </div>
   );
@@ -491,8 +476,47 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
     setEditIdx(null);
   }
 
+  // Debug: desenha retângulos das células sobre canvas
+  const debugCanvasRef = React.useRef();
+  React.useEffect(()=>{
+    if(!showDebug||!imgEl||!debugCanvasRef.current||debugCells.length===0) return;
+    const W=1400, H=Math.round(imgEl.naturalHeight*(W/imgEl.naturalWidth));
+    const cv2=debugCanvasRef.current;
+    cv2.width=W; cv2.height=H;
+    const ctx=cv2.getContext("2d");
+    ctx.drawImage(imgEl,0,0,W,H);
+    const LETRAS=["A","B","C","D","E"];
+    debugCells.forEach(({qi,xNroFim,xRestante,colW,linhaH,mV,mH,dens,iMax,marcada})=>{
+      const yc=Math.floor(qi*linhaH+linhaH*mV);
+      const hc=Math.max(Math.floor(linhaH*(1-2*mV)),1);
+      for(let li=0;li<5;li++){
+        const xc=Math.floor(xNroFim+li*colW+colW*mH);
+        const wc=Math.max(Math.floor(colW*(1-2*mH)),1);
+        const isMax=li===iMax;
+        ctx.strokeStyle=isMax?(marcada?"#00ff00":"#ff6600"):"#0088ff";
+        ctx.lineWidth=isMax?4:2;
+        ctx.strokeRect(xc,yc,wc,hc);
+        ctx.fillStyle=isMax?(marcada?"rgba(0,255,0,0.15)":"rgba(255,100,0,0.15)"):"rgba(0,100,255,0.08)";
+        ctx.fillRect(xc,yc,wc,hc);
+        ctx.fillStyle=isMax?(marcada?"#00cc00":"#ff4400"):"#005599";
+        ctx.font="bold "+(Math.floor(hc*0.35))+"px monospace";
+        ctx.textAlign="center";
+        ctx.fillText((dens[li]*100).toFixed(0)+"%",xc+wc/2,yc+hc*0.65);
+      }
+    });
+  },[showDebug,imgEl,debugCells]);
+
   if(etapa==="resultado")return(
     <div style={{minHeight:"100vh",background:"#f5f6fa"}}>
+      {/* Debug canvas */}
+      {showDebug&&(
+        <div style={{background:"#111",padding:"12px 16px"}}>
+          <p style={{color:"orange",fontSize:"12px",fontWeight:"700",marginBottom:"8px"}}>🔍 DEBUG — Verde=detectado, Laranja=maior mas abaixo do limiar, Azul=demais. % = densidade de pixels escuros.</p>
+          <div style={{overflowX:"auto"}}>
+            <canvas ref={debugCanvasRef} style={{maxWidth:"100%",height:"auto",display:"block"}}/>
+          </div>
+        </div>
+      )}
       {/* Popup de correção manual */}
       {editIdx !== null && (
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:100,display:"flex",alignItems:"flex-end",justifyContent:"center"}}
