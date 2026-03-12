@@ -273,18 +273,11 @@ function TelaAluno({prova, alunos, correcoes, onConfirmar, onVoltar}){
 }
 
 // ─── ANALISE OPENCV ────────────────────────────────────────────────────────────
-// Algoritmo v6 — Detecta preenchimento de CANETA pelo aluno
+// Algoritmo v8 — Detecta tabela por contorno retangular
 //
-// Cartão impresso: todas as células são brancas com letra cinza.
-// O aluno preenche a célula com caneta/lápis → muitos pixels escuros.
-// Células vazias: apenas a letrinha cinza impressa → poucos pixels escuros.
-//
-// Detecção RELATIVA por linha: procura a célula mais escura que domine as outras.
-// Sem limiar absoluto alto — funciona mesmo com cartões claros ou foto escura.
-//
-// Proporções (main.js): colNro=500, colLetra=850, tblW=4750
-//   → colNro  = 10.5% da largura total
-//   → colLetra = 17.9% cada
+// A tabela do cartão tem bordas grossas e pretas → maior retângulo na imagem.
+// Usa findContours para achar esse retângulo e trabalha APENAS dentro dele.
+// Isso ignora completamente texto fora da caixa (Nome, Colégio, etc).
 
 async function analisarCartao(imgEl, totalQ){
   if(typeof cv==="undefined"||!cv.Mat) await new Promise(r=>setTimeout(r,2500));
@@ -296,39 +289,92 @@ async function analisarCartao(imgEl, totalQ){
   canvas.width = W; canvas.height = H;
   canvas.getContext("2d").drawImage(imgEl, 0, 0, W, H);
 
-  const src    = cv.matFromImageData(canvas.getContext("2d").getImageData(0,0,W,H));
-  const gray   = new cv.Mat();
-  const thresh = new cv.Mat();
+  const src  = cv.matFromImageData(canvas.getContext("2d").getImageData(0,0,W,H));
+  const gray = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-  // Janela grande (61px) + constante baixa (6): captura manchas de caneta,
-  // ignora letrinhas impressas finas e ruído de grade
-  cv.adaptiveThreshold(gray, thresh, 255,
-    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 61, 6);
 
-  const LETRAS = ["A","B","C","D","E"];
+  // ── 1. Binarizar com Otsu ──────────────────────────────────────────────────
+  const bin = new cv.Mat();
+  cv.threshold(gray, bin, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+
+  // ── 2. Dilatar para fechar gaps nas bordas da tabela ──────────────────────
+  const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+  const dilated = new cv.Mat();
+  cv.dilate(bin, dilated, kernel);
+
+  // ── 3. Encontrar contornos e selecionar o maior retângulo ─────────────────
+  const contours = new cv.MatVector();
+  const hier     = new cv.Mat();
+  cv.findContours(dilated, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  // Área mínima: tabela deve ter pelo menos 5% da área total da imagem
+  const areaMin = W * H * 0.05;
+  let melhor = null; // {x, y, w, h}
+
+  for (let i = 0; i < contours.size(); i++) {
+    const cnt  = contours.get(i);
+    const rect = cv.boundingRect(cnt);
+    const area = rect.width * rect.height;
+    // Procura o maior retângulo com proporção razoável de tabela (mais largo que alto)
+    if (area > areaMin && rect.width > rect.height * 1.5) {
+      if (!melhor || area > melhor.w * melhor.h) {
+        melhor = { x: rect.x, y: rect.y, w: rect.width, h: rect.height };
+      }
+    }
+    cnt.delete();
+  }
+
+  // Fallback: se não achou retângulo bom, usa projeção de linhas
+  if (!melhor) {
+    const rowSum = new Array(H).fill(0);
+    const colSum = new Array(W).fill(0);
+    for (let py = 0; py < H; py++)
+      for (let px = 0; px < W; px++)
+        if (bin.ucharAt(py, px) > 128) { rowSum[py]++; colSum[px]++; }
+
+    let topo = 0, base = H-1, esq = 0, dir = W-1;
+    const limH = W * 0.03, limV = H * 0.03;
+    for (let py = 0; py < H; py++) if (rowSum[py] > limH) { topo = py; break; }
+    for (let py = H-1; py >= 0; py--) if (rowSum[py] > limH) { base = py; break; }
+    for (let px = 0; px < W; px++) if (colSum[px] > limV) { esq = px; break; }
+    for (let px = W-1; px >= 0; px--) if (colSum[px] > limV) { dir = px; break; }
+    melhor = { x: esq, y: topo, w: dir - esq, h: base - topo };
+  }
+
+  // Margem interna de 2px para não pegar as bordas
+  const tx = melhor.x + 2, ty = melhor.y + 2;
+  const tw = melhor.w - 4, th = melhor.h - 4;
+
+  console.log("[v8] Tabela: x="+tx+" y="+ty+" w="+tw+" h="+th);
+
+  // ── 4. Threshold adaptativo para detectar marcações ───────────────────────
+  const thresh = new cv.Mat();
+  cv.adaptiveThreshold(gray, thresh, 255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 51, 8);
+
+  // ── 5. Dividir tabela em linhas (questões) e colunas (alternativas) ────────
+  // Proporções (main.js): colNro=500, colLetra=850, tblW=4750
+  const nroFrac  = 500 / 4750;  // ~10.5% — coluna do número
+  const LETRAS   = ["A","B","C","D","E"];
   const respostas = [];
 
-  const nroFrac = 500 / 4750;   // fração da coluna Nº
   const doisBlocos = totalQ > 20;
   const metade     = Math.ceil(totalQ / 2);
 
-  function detectarBloco(questoesNoBloco, xOffset, blocoW) {
-    const linhaH    = H / questoesNoBloco;
-    const xNroFim   = xOffset + blocoW * nroFrac;
-    const xRestante = blocoW * (1 - nroFrac);
-    const colW      = xRestante / 5;
+  function detectarBloco(questoesNoBloco, xOff, blocoW) {
+    const linhaH  = th / questoesNoBloco;
+    const xNroFim = tx + xOff + blocoW * nroFrac;
+    const colW    = blocoW * (1 - nroFrac) / 5;
 
     for (let qi = 0; qi < questoesNoBloco; qi++) {
-      // Margens conservadoras: ignora bordas da grade
-      const mV = 0.12;
-      const mH = 0.10;
-      const yc = Math.floor(qi * linhaH + linhaH * mV);
+      const mV = 0.08, mH = 0.06;
+      const yc = Math.floor(ty + qi * linhaH + linhaH * mV);
       const hc = Math.max(Math.floor(linhaH * (1 - 2*mV)), 1);
 
       const dens = [];
       for (let li = 0; li < 5; li++) {
-        const xc  = Math.floor(xNroFim + li * colW + colW * mH);
-        const wc  = Math.max(Math.floor(colW * (1 - 2*mH)), 1);
+        const xc = Math.floor(xNroFim + li * colW + colW * mH);
+        const wc = Math.max(Math.floor(colW * (1 - 2*mH)), 1);
 
         let escuros = 0;
         for (let py = yc; py < yc+hc && py < H; py++)
@@ -344,30 +390,31 @@ async function analisarCartao(imgEl, totalQ){
       const seg   = Math.max(...resto, 0.001);
       const med   = resto.reduce((a,v)=>a+v,0) / resto.length;
 
-      // Caneta preenche muito mais que letra impressa.
-      // Limiar baixo (3%) + dominância relativa = detecta mesmo cartões claros.
-      const marcada = maxD >= 0.03        // há pixels escuros suficientes
-                   && maxD >= seg * 1.6   // domina a segunda alternativa
-                   && maxD >= med * 2.2;  // domina a média das demais
+      // Preenchimento sólido (caneta cobrindo célula inteira): 40-80% escuro
+      // Letra impressa cinza: 5-15% escuro
+      // Limiar baixo + dominância: detecta hachura e preenchimento sólido
+      const marcada = maxD >= 0.04
+                   && maxD >= seg * 1.5
+                   && maxD >= med * 2.0;
 
-      console.log("[v6] Q"+(qi+1)+" dens="+dens.map(d=>d.toFixed(3))+" → "+(marcada?LETRAS[iMax]:"?"));
+      console.log("[v8] Q"+(qi+1)+" ["+dens.map(d=>(d*100).toFixed(0)+"%").join("|")+"] → "+(marcada?LETRAS[iMax]:"?"));
       respostas.push(marcada ? LETRAS[iMax] : null);
     }
   }
 
   if (!doisBlocos) {
-    detectarBloco(totalQ, 0, W);
+    detectarBloco(totalQ, 0, tw);
   } else {
-    const gap    = Math.floor(W * 0.04);
-    const blocoW = Math.floor((W - gap) / 2);
+    const gap    = Math.floor(tw * 0.04);
+    const blocoW = Math.floor((tw - gap) / 2);
     detectarBloco(metade, 0, blocoW);
     detectarBloco(totalQ - metade, blocoW + gap, blocoW);
   }
 
-  src.delete(); gray.delete(); thresh.delete();
+  src.delete(); gray.delete(); bin.delete(); dilated.delete();
+  kernel.delete(); contours.delete(); hier.delete(); thresh.delete();
   return respostas;
 }
-
 // ─── TELA CORRECAO ─────────────────────────────────────────────────────────────
 function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   const [etapa,setEtapa]=React.useState("instrucao");
