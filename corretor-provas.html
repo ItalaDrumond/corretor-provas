@@ -273,22 +273,14 @@ function TelaAluno({prova, alunos, correcoes, onConfirmar, onVoltar}){
 }
 
 // ─── ANALISE OPENCV ────────────────────────────────────────────────────────────
-// Algoritmo v4 — Alinhado ao novo cartão (5 questões/bloco, bolinhas grandes)
+// Algoritmo v5 — Detecção automática do cartão na imagem
 //
-// O novo cartão tem:
-//   - 5 questões por bloco (coluna), não 10
-//   - Células de ~1,6cm (colLetra=900 twips) — muito mais espaço
-//   - Bordas internas claras (CCCCCC) — menos ruído
-//   - Bolinhas de fonte 44 (~11pt) — círculo grande, fácil de preencher
+// Problema: a foto sempre captura parte do cabeçalho da prova (Nome, Data)
+// acima do cartão, deslocando toda a análise para cima.
 //
-// Com células grandes, caneta preenche uma área significativa.
-// O algoritmo fica simples e direto:
-//   1. Normaliza para 1200px
-//   2. Threshold adaptativo janela 41px (proporcional à célula maior)
-//   3. Margem interna 22% — bem longe das bordas/grades
-//   4. Decisão: célula marcada precisa ter > 18% de preenchimento
-//      E ser pelo menos 2.5× maior que a segunda — caneta em célula grande
-//      preenche 30-60%, ruído de grade fica abaixo de 8%
+// Solução: antes de analisar, varre a imagem de cima para baixo procurando
+// a faixa escura do cabeçalho da tabela (linha "Nº 1 2 3 4 5" com fundo
+// escuro #1a1a2e). Tudo acima dessa faixa é descartado automaticamente.
 
 async function analisarCartao(imgEl, totalQ){
   if(typeof cv==="undefined"||!cv.Mat) await new Promise(r=>setTimeout(r,2500));
@@ -296,51 +288,71 @@ async function analisarCartao(imgEl, totalQ){
 
   // 1. Normaliza resolução
   const W = 1200;
-  const H = Math.round(imgEl.naturalHeight * (W / imgEl.naturalWidth));
+  const Hfull = Math.round(imgEl.naturalHeight * (W / imgEl.naturalWidth));
   const canvas = document.createElement("canvas");
-  canvas.width = W; canvas.height = H;
-  canvas.getContext("2d").drawImage(imgEl, 0, 0, W, H);
+  canvas.width = W; canvas.height = Hfull;
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(imgEl, 0, 0, W, Hfull);
 
-  // 2. Cinza + threshold adaptativo
-  const src    = cv.matFromImageData(canvas.getContext("2d").getImageData(0,0,W,H));
+  // 2. Detectar onde começa o cabeçalho escuro do cartão
+  // Varre linhas de cima pra baixo; procura a primeira linha onde
+  // >55% dos pixels têm luminância < 80 (fundo escuro = cabeçalho da tabela)
+  const imgData = ctx.getImageData(0, 0, W, Hfull);
+  const pixels  = imgData.data;
+
+  let yCartao = 0;
+  const amostras = 40;
+  const passo    = Math.floor(W / amostras);
+
+  for(let y = 0; y < Hfull; y++){
+    let escuros = 0;
+    for(let s = 0; s < amostras; s++){
+      const x   = s * passo;
+      const idx = (y * W + x) * 4;
+      const lum = 0.299*pixels[idx] + 0.587*pixels[idx+1] + 0.114*pixels[idx+2];
+      if(lum < 80) escuros++;
+    }
+    if(escuros / amostras >= 0.55){
+      yCartao = y;
+      break;
+    }
+  }
+
+  // Pequena margem acima para não cortar a borda externa da tabela
+  yCartao = Math.max(0, yCartao - Math.floor(Hfull * 0.01));
+
+  // 3. Recortar apenas a região do cartão (abaixo do cabeçalho)
+  const H = Hfull - yCartao;
+  const cartaoData = ctx.getImageData(0, yCartao, W, H);
+
+  // 4. Cinza + threshold adaptativo sobre o recorte
+  const src    = cv.matFromImageData(cartaoData);
   const gray   = new cv.Mat();
   const thresh = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-  // Janela 41px: ignora linhas finas da grade, captura preenchimentos sólidos
   cv.adaptiveThreshold(gray, thresh, 255,
     cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 41, 8);
 
   const LETRAS      = ["A","B","C","D","E"];
-  // Novo cartão: 5 questões por bloco
   const QTD_BLOCO   = 5;
   const totalBlocos = Math.ceil(totalQ / QTD_BLOCO);
   const respostas   = [];
-
-  // Proporções do novo cartão (espelha main.js: colLabel=560, colLetra=900)
-  // colLabel representa ~38% da largura total de um bloco de 1 questão
-  // Usamos fração relativa à largura da imagem normalizada
-  // label ocupa colLabel/(colLabel + colLetra*qtd) da largura total
-  // Para simplificar: label = 12% da largura (similar ao anterior, funciona bem)
-  const labelFrac = 0.12;
+  const labelFrac   = 0.12;
 
   for(let b = 0; b < totalBlocos; b++){
-    const ini    = b * QTD_BLOCO;
-    const fim    = Math.min(ini + QTD_BLOCO, totalQ);
-    const qtd    = fim - ini;
-
-    const blocoH = H / totalBlocos;
-    const yBloco = b * blocoH;
-    // 6 linhas: 1 cabeçalho + 5 letras
-    const linhaH = blocoH / 6;
-
-    const labelW = W * labelFrac;
-    const colW   = (W - labelW) / qtd;
+    const ini     = b * QTD_BLOCO;
+    const fim     = Math.min(ini + QTD_BLOCO, totalQ);
+    const qtd     = fim - ini;
+    const blocoH  = H / totalBlocos;
+    const yBloco  = b * blocoH;
+    const linhaH  = blocoH / 6;
+    const labelW  = W * labelFrac;
+    const colW    = (W - labelW) / qtd;
 
     for(let qi = 0; qi < qtd; qi++){
       const dens = [];
 
       for(let li = 0; li < 5; li++){
-        // Margem 22%: bem longe das bordas da grade
         const m  = 0.22;
         const yc = Math.floor(yBloco + (li+1) * linhaH + linhaH * m);
         const hc = Math.max(Math.floor(linhaH * (1 - 2*m)), 1);
@@ -355,18 +367,15 @@ async function analisarCartao(imgEl, totalQ){
         dens.push(escuros / (wc * hc));
       }
 
-      // Decisão
       const maxD   = Math.max(...dens);
       const iMax   = dens.indexOf(maxD);
       const semMax = dens.filter((_,i) => i !== iMax);
       const seg    = Math.max(...semMax);
       const med    = semMax.reduce((a,v)=>a+v,0) / semMax.length;
 
-      // Caneta em célula grande: preenche 25-60%
-      // Ruído de grade em célula grande: fica em 2-8%
-      const marcada = maxD >= 0.18       // mínimo absoluto generoso
-                   && maxD >= seg * 2.5  // domina a segunda
-                   && maxD >= med * 4.0; // domina a média das outras
+      const marcada = maxD >= 0.18
+                   && maxD >= seg * 2.5
+                   && maxD >= med * 4.0;
 
       respostas.push(marcada ? LETRAS[iMax] : null);
     }
@@ -375,7 +384,6 @@ async function analisarCartao(imgEl, totalQ){
   src.delete(); gray.delete(); thresh.delete();
   return respostas;
 }
-
 // ─── TELA CORRECAO ─────────────────────────────────────────────────────────────
 function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   const [etapa,setEtapa]=React.useState("instrucao");
