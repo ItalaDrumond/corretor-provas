@@ -307,7 +307,6 @@ async function analisarCartao(imgEl, totalQ){
 
   const LETRAS = ["A","B","C","D","E"];
   const respostas = [];
-  const debugCells = [];
 
   const nroFrac = 500 / 4750;   // fração da coluna Nº
   const doisBlocos = totalQ > 20;
@@ -353,7 +352,6 @@ async function analisarCartao(imgEl, totalQ){
 
       console.log("[v6] Q"+(qi+1)+" dens="+dens.map(d=>d.toFixed(3))+" → "+(marcada?LETRAS[iMax]:"?"));
       respostas.push(marcada ? LETRAS[iMax] : null);
-      debugCells.push({ qi, xOffset, blocoW, linhaH, xNroFim, xRestante, colW, mV, mH, dens:[...dens], iMax, marcada });
     }
   }
 
@@ -367,7 +365,7 @@ async function analisarCartao(imgEl, totalQ){
   }
 
   src.delete(); gray.delete(); thresh.delete();
-  return { respostas, debugCells };
+  return respostas;
 }
 
 // ─── TELA CORRECAO ─────────────────────────────────────────────────────────────
@@ -378,10 +376,7 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   const [respostas,setRespostas]=React.useState([]);
   const [erro,setErro]=React.useState("");
   const [editIdx,setEditIdx]=React.useState(null);
-  const [debugCells,setDebugCells]=React.useState([]);
-  const [showDebug,setShowDebug]=React.useState(false);
   const fileRef=React.useRef();
-  const debugCanvasRef=React.useRef();
   const gabarito=prova.gabarito_sequencia?.split(",")||[];
   const total=prova.total_questoes||0;
 
@@ -395,8 +390,7 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
     if(!imgEl)return;setEtapa("analisando");setErro("");
     try{
       const resultado=await analisarCartao(imgEl,total);
-      setRespostas(resultado.respostas);
-      setDebugCells(resultado.debugCells);
+      setRespostas(resultado);
       setEtapa("resultado");
     }
     catch(e){setErro("Erro: "+e.message);setEtapa("foto");}
@@ -414,35 +408,6 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
     return soma + (acertou ? (pontos[i] || 1) : 0);
   }, 0);
   const nota = totalPontos > 0 ? ((pontosAluno / totalPontos) * 10).toFixed(1) : "0";
-
-  // Debug: desenha retângulos das células sobre canvas
-  React.useEffect(()=>{
-    if(!showDebug||!imgEl||!debugCanvasRef.current||debugCells.length===0) return;
-    const W=1400, H=Math.round(imgEl.naturalHeight*(W/imgEl.naturalWidth));
-    const cv2=debugCanvasRef.current;
-    cv2.width=W; cv2.height=H;
-    const ctx=cv2.getContext("2d");
-    ctx.drawImage(imgEl,0,0,W,H);
-    const LETRAS=["A","B","C","D","E"];
-    debugCells.forEach(({qi,xNroFim,xRestante,colW,linhaH,mV,mH,dens,iMax,marcada})=>{
-      const yc=Math.floor(qi*linhaH+linhaH*mV);
-      const hc=Math.max(Math.floor(linhaH*(1-2*mV)),1);
-      for(let li=0;li<5;li++){
-        const xc=Math.floor(xNroFim+li*colW+colW*mH);
-        const wc=Math.max(Math.floor(colW*(1-2*mH)),1);
-        const isMax=li===iMax;
-        ctx.strokeStyle=isMax?(marcada?"#00ff00":"#ff6600"):"#0088ff";
-        ctx.lineWidth=isMax?4:2;
-        ctx.strokeRect(xc,yc,wc,hc);
-        ctx.fillStyle=isMax?(marcada?"rgba(0,255,0,0.15)":"rgba(255,100,0,0.15)"):"rgba(0,100,255,0.08)";
-        ctx.fillRect(xc,yc,wc,hc);
-        ctx.fillStyle=isMax?(marcada?"#00cc00":"#ff4400"):"#005599";
-        ctx.font="bold "+(Math.floor(hc*0.35))+"px monospace";
-        ctx.textAlign="center";
-        ctx.fillText((dens[li]*100).toFixed(0)+"%",xc+wc/2,yc+hc*0.65);
-      }
-    });
-  },[showDebug,imgEl,debugCells]);
 
     if(etapa==="instrucao")return(
     <div style={{minHeight:"100vh",background:"#f5f6fa"}}>
@@ -484,8 +449,7 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
       <div style={{padding:"16px 20px 32px",display:"flex",gap:"12px"}}>
         <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{display:"none"}} onChange={onFoto}/>
         <button onClick={()=>fileRef.current.click()} style={{flex:1,padding:"14px",background:"rgba(255,255,255,0.1)",border:"2px solid rgba(255,255,255,0.2)",borderRadius:"12px",color:"#fff",fontSize:"14px",fontWeight:"600",cursor:"pointer"}}>Refazer</button>
-        <button onClick={()=>{setShowDebug(false);handleAnalisar();}} style={{flex:2,padding:"14px",background:"linear-gradient(135deg,#4361ee,#7209b7)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"15px",fontWeight:"700",cursor:"pointer"}}>&#10003; Analisar</button>
-        <button onClick={()=>{setShowDebug(true);handleAnalisar();}} style={{flex:1,padding:"14px",background:"rgba(255,165,0,0.25)",border:"2px solid orange",borderRadius:"12px",color:"orange",fontSize:"13px",fontWeight:"600",cursor:"pointer"}}>&#128269; Debug</button>
+        <button onClick={handleAnalisar} style={{flex:2,padding:"14px",background:"linear-gradient(135deg,#4361ee,#7209b7)",border:"none",borderRadius:"12px",color:"#fff",fontSize:"15px",fontWeight:"700",cursor:"pointer"}}>&#10003; Analisar</button>
       </div>
     </div>
   );
@@ -510,14 +474,6 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   if(etapa==="resultado")return(
     <div style={{minHeight:"100vh",background:"#f5f6fa"}}>
       {/* Debug canvas */}
-      {showDebug&&(
-        <div style={{background:"#111",padding:"12px 16px"}}>
-          <p style={{color:"orange",fontSize:"12px",fontWeight:"700",marginBottom:"8px"}}>🔍 DEBUG — Verde=detectado, Laranja=maior mas abaixo do limiar, Azul=demais. % = densidade de pixels escuros.</p>
-          <div style={{overflowX:"auto"}}>
-            <canvas ref={debugCanvasRef} style={{maxWidth:"100%",height:"auto",display:"block"}}/>
-          </div>
-        </div>
-      )}
       {/* Popup de correção manual */}
       {editIdx !== null && (
         <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:100,display:"flex",alignItems:"flex-end",justifyContent:"center"}}
