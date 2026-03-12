@@ -273,133 +273,126 @@ function TelaAluno({prova, alunos, correcoes, onConfirmar, onVoltar}){
 }
 
 // ─── ANALISE OPENCV ────────────────────────────────────────────────────────────
-// Algoritmo v6 — Normalização por linha (tolerante a sombra)
+// Algoritmo v5 — Novo cartão: questão por LINHA, alternativas por COLUNA
 //
-// Problema observado: sombra do celular cobre parte do cartão, reduzindo
-// o contraste da célula marcada. O threshold absoluto falha porque a célula
-// marcada na sombra pode ter densidade similar ao ruído fora da sombra.
+// Layout do cartão gerado pelo main.js:
+//   | Nº |  A  |  B  |  C  |  D  |  E  |
+//   |  1 |  A  |  B  |  C  |  D  |  E  |   ← aluno preenche a célula com caneta
+//   |  2 |  A  |  B  |  C  |  D  |  E  |
+//   ...
+// Célula marcada = fundo escuro (#1a1a2e) + letra branca
+// Célula vazia   = fundo branco + letra cinza
 //
-// Solução: NORMALIZAÇÃO POR LINHA
-// Em vez de comparar densidades absolutas, cada célula é comparada apenas
-// com as outras 4 células da MESMA questão (mesma coluna).
-// A sombra afeta todas as 5 células da linha igualmente — a célula marcada
-// continua sendo a mais escura da linha mesmo sob sombra.
+// Proporções (espelhando main.js):
+//   colNro   = 500 twips  (~10,9% da largura total da tabela de 1 col)
+//   colLetra = 850 twips  cada uma
+//   tblW     = 500 + 850*5 = 4750 twips
+//   → colNro  ocupa 500/4750 ≈ 10,5% da largura
+//   → cada alternativa ocupa 850/4750 ≈ 17,9% da largura
 //
-// Critério de decisão:
-//   1. A célula deve ser a mais escura da linha (rank 1)
-//   2. Deve ter densidade pelo menos 2× maior que a segunda (dominância)
-//   3. Mínimo absoluto de 8% — abaixo disso é só ruído mesmo com sombra
-//      (threshold baixo pois a sombra já reduz os valores absolutos)
+// Para provas > 20 questões: duas tabelas lado a lado (col esq = 1..metade, col dir = resto)
+// Nesse caso a imagem precisa mostrar o cartão inteiro.
+//
+// Detecção: para cada questão (linha), mede a densidade de pixels escuros
+// em cada uma das 5 células de alternativa (sem a coluna Nº).
+// A célula mais escura que superar o limiar é a resposta marcada.
 
 async function analisarCartao(imgEl, totalQ){
   if(typeof cv==="undefined"||!cv.Mat) await new Promise(r=>setTimeout(r,2500));
   if(typeof cv==="undefined"||!cv.Mat) throw new Error("OpenCV não carregou. Tente novamente.");
 
-  // 1. Normaliza resolução
-  const W = 1200;
-  const Hfull = Math.round(imgEl.naturalHeight * (W / imgEl.naturalWidth));
+  // 1. Normaliza para largura fixa
+  const W = 1400;
+  const H = Math.round(imgEl.naturalHeight * (W / imgEl.naturalWidth));
   const canvas = document.createElement("canvas");
-  canvas.width = W; canvas.height = Hfull;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(imgEl, 0, 0, W, Hfull);
+  canvas.width = W; canvas.height = H;
+  canvas.getContext("2d").drawImage(imgEl, 0, 0, W, H);
 
-  // 2. Detectar onde começa o cabeçalho escuro do cartão
-  const imgData = ctx.getImageData(0, 0, W, Hfull);
-  const pixels  = imgData.data;
-  let yCartao = 0;
-  const amostras = 40;
-  const passo    = Math.floor(W / amostras);
-  for(let y = 0; y < Hfull; y++){
-    let escuros = 0;
-    for(let s = 0; s < amostras; s++){
-      const x   = s * passo;
-      const idx = (y * W + x) * 4;
-      const lum = 0.299*pixels[idx] + 0.587*pixels[idx+1] + 0.114*pixels[idx+2];
-      if(lum < 80) escuros++;
-    }
-    if(escuros / amostras >= 0.55){ yCartao = y; break; }
-  }
-  yCartao = Math.max(0, yCartao - Math.floor(Hfull * 0.01));
-
-  // 3. Recortar região do cartão
-  const H = Hfull - yCartao;
-  const cartaoData = ctx.getImageData(0, yCartao, W, H);
-
-  // 4. Converter para escala de cinza (sem threshold global)
-  // Usamos a imagem em cinza diretamente para medir intensidade por célula
-  // Isso preserva a informação relativa entre células da mesma linha
-  const src  = cv.matFromImageData(cartaoData);
-  const gray = new cv.Mat();
-  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-  // Threshold adaptativo com janela grande — apenas para detectar pixels marcados
-  // A janela grande (61px) garante que a região local de referência seja maior
-  // que uma célula, capturando o contexto de iluminação ao redor
+  // 2. Cinza + threshold adaptativo
+  // Janela 31px captura texto/letra dentro da célula sem pegar bordas finas
+  const src    = cv.matFromImageData(canvas.getContext("2d").getImageData(0,0,W,H));
+  const gray   = new cv.Mat();
   const thresh = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
   cv.adaptiveThreshold(gray, thresh, 255,
-    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 61, 6);
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 31, 9);
 
-  const LETRAS      = ["A","B","C","D","E"];
-  const QTD_BLOCO   = 5;
-  const totalBlocos = Math.ceil(totalQ / QTD_BLOCO);
-  const respostas   = [];
-  const labelFrac   = 0.12;
+  const LETRAS = ["A","B","C","D","E"];
+  const respostas = [];
 
-  for(let b = 0; b < totalBlocos; b++){
-    const ini    = b * QTD_BLOCO;
-    const fim    = Math.min(ini + QTD_BLOCO, totalQ);
-    const qtd    = fim - ini;
-    const blocoH = H / totalBlocos;
-    const yBloco = b * blocoH;
-    const linhaH = blocoH / 6;
-    const labelW = W * labelFrac;
-    const colW   = (W - labelW) / qtd;
+  // Proporções do cartão (alinhadas ao main.js)
+  // colNro = 500, colLetra = 850, tblW = 4750
+  // fração da coluna Nº sobre largura total:
+  const nroFrac   = 500  / 4750;  // ≈ 0.105
+  const letraFrac = 850  / 4750;  // ≈ 0.179 por alternativa
 
-    for(let qi = 0; qi < qtd; qi++){
-      // Mede densidade de pixels marcados em cada célula A-E desta questão
+  // Para dois blocos lado a lado (> 20 questões):
+  // cada bloco ocupa metade da largura com ~360twips de gap (~4% da largura)
+  const doisBlocos = totalQ > 20;
+  const metade     = Math.ceil(totalQ / 2);
+
+  function detectarBloco(questoesNoBloco, xOffset, blocoW) {
+    // xOffset e blocoW em pixels
+    // Cada linha = 1 questão. Altura de cada linha = blocoH / questoesNoBloco
+    const blocoH = H;
+    const linhaH = blocoH / questoesNoBloco;
+    const xNroFim = xOffset + blocoW * nroFrac;   // fim da coluna Nº
+    const xRestante = blocoW * (1 - nroFrac);      // largura das 5 alternativas
+
+    for (let qi = 0; qi < questoesNoBloco; qi++) {
+      const yTopo = Math.floor(qi * linhaH);
+      const yBase = Math.floor((qi + 1) * linhaH);
+
       const dens = [];
-      for(let li = 0; li < 5; li++){
-        const m  = 0.22;
-        const yc = Math.floor(yBloco + (li+1) * linhaH + linhaH * m);
-        const hc = Math.max(Math.floor(linhaH * (1 - 2*m)), 1);
-        const xc = Math.floor(labelW + qi * colW + colW * m);
-        const wc = Math.max(Math.floor(colW * (1 - 2*m)), 1);
+      for (let li = 0; li < 5; li++) {
+        // Margem interna: 20% das bordas para evitar ruído da grade
+        const m = 0.20;
+        const xc  = Math.floor(xNroFim + li * xRestante/5 + xRestante/5 * m);
+        const wc  = Math.max(Math.floor(xRestante/5 * (1 - 2*m)), 1);
+        const yc  = Math.floor(yTopo + linhaH * m);
+        const hc  = Math.max(Math.floor(linhaH * (1 - 2*m)), 1);
 
         let escuros = 0;
-        for(let py = yc; py < yc+hc && py < H; py++)
-          for(let px = xc; px < xc+wc && px < W; px++)
-            if(thresh.ucharAt(py, px) > 128) escuros++;
+        for (let py = yc; py < yc+hc && py < H; py++)
+          for (let px = xc; px < xc+wc && px < W; px++)
+            if (thresh.ucharAt(py, px) > 128) escuros++;
 
         dens.push(escuros / (wc * hc));
       }
 
-      // ── Decisão por normalização relativa ──────────────────────────────
-      const maxD   = Math.max(...dens);
-      const iMax   = dens.indexOf(maxD);
-      const semMax = dens.filter((_,i) => i !== iMax);
-      const seg    = Math.max(...semMax);
-      const med    = semMax.reduce((a,v)=>a+v,0) / semMax.length;
+      // Decisão: célula marcada tem fundo escuro → muito mais pixels pretos
+      // Célula vazia tem apenas a letra cinza fina → baixa densidade
+      const maxD  = Math.max(...dens);
+      const iMax  = dens.indexOf(maxD);
+      const resto = dens.filter((_,i) => i !== iMax);
+      const seg   = Math.max(...resto);
+      const med   = resto.reduce((a,v)=>a+v,0) / resto.length;
 
-      // Critério 1: mínimo absoluto baixo (8%) — tolerante a sombra
-      //   Sombra reduz os valores mas caneta ainda passa 8% facilmente
-      const minAbs = maxD >= 0.08;
+      // Limiar: célula preenchida com caneta sobre letra → ≥25% de escuro
+      // Célula vazia com letra cinza fina → ≤10%
+      const marcada = maxD >= 0.20        // mínimo absoluto
+                   && maxD >= seg * 2.0   // pelo menos 2× a segunda
+                   && maxD >= med * 3.5;  // domina bem a média
 
-      // Critério 2: dominância sobre a segunda célula
-      //   A sombra afeta TODAS as células igualmente, então a razão se mantém
-      //   Exige 2× (menos rígido que antes) pois sombra comprime os valores
-      const domSeg = maxD >= seg * 2.0;
-
-      // Critério 3: dominância sobre a média das outras 4
-      //   Exige 3× — caneta preenche bem mesmo sob sombra
-      const domMed = maxD >= med * 3.0;
-
-      respostas.push((minAbs && domSeg && domMed) ? LETRAS[iMax] : null);
+      respostas.push(marcada ? LETRAS[iMax] : null);
     }
+  }
+
+  if (!doisBlocos) {
+    // Tabela única ocupando toda a largura
+    detectarBloco(totalQ, 0, W);
+  } else {
+    // Duas tabelas lado a lado — gap central de ~4% da largura
+    const gap    = Math.floor(W * 0.04);
+    const blocoW = Math.floor((W - gap) / 2);
+    detectarBloco(metade, 0, blocoW);
+    detectarBloco(totalQ - metade, blocoW + gap, blocoW);
   }
 
   src.delete(); gray.delete(); thresh.delete();
   return respostas;
 }
+
 // ─── TELA CORRECAO ─────────────────────────────────────────────────────────────
 function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   const [etapa,setEtapa]=React.useState("instrucao");
