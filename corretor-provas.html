@@ -381,6 +381,7 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   const [debugCells,setDebugCells]=React.useState([]);
   const [showDebug,setShowDebug]=React.useState(false);
   const fileRef=React.useRef();
+  const debugCanvasRef=React.useRef();
   const gabarito=prova.gabarito_sequencia?.split(",")||[];
   const total=prova.total_questoes||0;
 
@@ -414,7 +415,36 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
   }, 0);
   const nota = totalPontos > 0 ? ((pontosAluno / totalPontos) * 10).toFixed(1) : "0";
 
-  if(etapa==="instrucao")return(
+  // Debug: desenha retângulos das células sobre canvas
+  React.useEffect(()=>{
+    if(!showDebug||!imgEl||!debugCanvasRef.current||debugCells.length===0) return;
+    const W=1400, H=Math.round(imgEl.naturalHeight*(W/imgEl.naturalWidth));
+    const cv2=debugCanvasRef.current;
+    cv2.width=W; cv2.height=H;
+    const ctx=cv2.getContext("2d");
+    ctx.drawImage(imgEl,0,0,W,H);
+    const LETRAS=["A","B","C","D","E"];
+    debugCells.forEach(({qi,xNroFim,xRestante,colW,linhaH,mV,mH,dens,iMax,marcada})=>{
+      const yc=Math.floor(qi*linhaH+linhaH*mV);
+      const hc=Math.max(Math.floor(linhaH*(1-2*mV)),1);
+      for(let li=0;li<5;li++){
+        const xc=Math.floor(xNroFim+li*colW+colW*mH);
+        const wc=Math.max(Math.floor(colW*(1-2*mH)),1);
+        const isMax=li===iMax;
+        ctx.strokeStyle=isMax?(marcada?"#00ff00":"#ff6600"):"#0088ff";
+        ctx.lineWidth=isMax?4:2;
+        ctx.strokeRect(xc,yc,wc,hc);
+        ctx.fillStyle=isMax?(marcada?"rgba(0,255,0,0.15)":"rgba(255,100,0,0.15)"):"rgba(0,100,255,0.08)";
+        ctx.fillRect(xc,yc,wc,hc);
+        ctx.fillStyle=isMax?(marcada?"#00cc00":"#ff4400"):"#005599";
+        ctx.font="bold "+(Math.floor(hc*0.35))+"px monospace";
+        ctx.textAlign="center";
+        ctx.fillText((dens[li]*100).toFixed(0)+"%",xc+wc/2,yc+hc*0.65);
+      }
+    });
+  },[showDebug,imgEl,debugCells]);
+
+    if(etapa==="instrucao")return(
     <div style={{minHeight:"100vh",background:"#f5f6fa"}}>
       <div style={{background:"linear-gradient(135deg,#1a1a2e,#0f3460)",padding:"48px 20px 24px"}}>
         <button onClick={onVoltar} style={{background:"none",border:"none",color:"rgba(255,255,255,0.7)",fontSize:"14px",cursor:"pointer",marginBottom:"14px",padding:0}}>&#8592; Voltar</button>
@@ -476,35 +506,6 @@ function TelaCorrecao({prova,aluno,turma,onSalvar,onVoltar}){
     setEditIdx(null);
   }
 
-  // Debug: desenha retângulos das células sobre canvas
-  const debugCanvasRef = React.useRef();
-  React.useEffect(()=>{
-    if(!showDebug||!imgEl||!debugCanvasRef.current||debugCells.length===0) return;
-    const W=1400, H=Math.round(imgEl.naturalHeight*(W/imgEl.naturalWidth));
-    const cv2=debugCanvasRef.current;
-    cv2.width=W; cv2.height=H;
-    const ctx=cv2.getContext("2d");
-    ctx.drawImage(imgEl,0,0,W,H);
-    const LETRAS=["A","B","C","D","E"];
-    debugCells.forEach(({qi,xNroFim,xRestante,colW,linhaH,mV,mH,dens,iMax,marcada})=>{
-      const yc=Math.floor(qi*linhaH+linhaH*mV);
-      const hc=Math.max(Math.floor(linhaH*(1-2*mV)),1);
-      for(let li=0;li<5;li++){
-        const xc=Math.floor(xNroFim+li*colW+colW*mH);
-        const wc=Math.max(Math.floor(colW*(1-2*mH)),1);
-        const isMax=li===iMax;
-        ctx.strokeStyle=isMax?(marcada?"#00ff00":"#ff6600"):"#0088ff";
-        ctx.lineWidth=isMax?4:2;
-        ctx.strokeRect(xc,yc,wc,hc);
-        ctx.fillStyle=isMax?(marcada?"rgba(0,255,0,0.15)":"rgba(255,100,0,0.15)"):"rgba(0,100,255,0.08)";
-        ctx.fillRect(xc,yc,wc,hc);
-        ctx.fillStyle=isMax?(marcada?"#00cc00":"#ff4400"):"#005599";
-        ctx.font="bold "+(Math.floor(hc*0.35))+"px monospace";
-        ctx.textAlign="center";
-        ctx.fillText((dens[li]*100).toFixed(0)+"%",xc+wc/2,yc+hc*0.65);
-      }
-    });
-  },[showDebug,imgEl,debugCells]);
 
   if(etapa==="resultado")return(
     <div style={{minHeight:"100vh",background:"#f5f6fa"}}>
